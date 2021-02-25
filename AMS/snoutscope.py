@@ -64,8 +64,7 @@ class Snoutscope:
         # TODO: Does this belong in init? I think it maybe belongs in
         # the init of the GUI? Or the acquisition script? I can imagine
         # cases where you want to skip this.
-        self.snoutfocus(filename='snoutfocus_series.tif', # Save for inspection
-                        verbose=True) # Look at piezo voltage
+        self.snoutfocus(filename='snoutfocus_series.tif') # Save for inspection
         print('Finished initializing Snoutscope')
         # Note: snoutfocus task is probably still running
         # Note: you still have to call .apply_settings() before you can .snap()
@@ -168,7 +167,6 @@ class Snoutscope:
         self,
         delay_seconds=None,
         filename=None,
-        verbose=False,
         ):
         def snoutfocus_task(custody):
             custody.switch_from(None, to=self.camera) # safe to change settings
@@ -181,22 +179,25 @@ class Snoutscope:
             self._settings_are_sane = False # In case the thread crashes
             # Record the settings we'll have to reset:
             old_filter_wheel_position = self.filter_wheel_position
-            old_roi = self.camera._get_roi()
-            old_exp_us = self.camera._get_exposure_time()
+            old_roi = self.camera.roi
+            old_exp_us = self.camera.exposure_time_microseconds
+            timestamp_mode = self.camera.timestamp_mode
             # Get microscope settings ready to take our measurement:
             self.filter_wheel.move(1, speed=6, block=False) # Empty slot
-            self.snoutfocus_controller.set_voltage(0, block=False)
+            self.snoutfocus_controller.set_voltage(
+                0, block=False) # Slow, but filter wheel is slower
             self.camera.disarm()
             self.camera._set_roi({'left': 901, 'top': 901, # reduce for speed
                                   'right': 1160, 'bottom': 1148})
             self.camera._set_exposure_time(100) # Microseconds
+            self.camera.arm(16)
             # Calculate voltages for the analog-out card:
             exp_pix = self.ao.s2p(1e-6*self.camera.exposure_time_microseconds)
             roll_pix = self.ao.s2p(1e-6*self.camera.rolling_time_microseconds)
-            jitter_pix = max(self.ao.s2p(30e-6), 1) # Maybe as low as 30 us?
-            piezo_settling_pix = self.ao.s2p(0.000) # ~1 ms?
-            period_pix = (max(exp_pix, roll_pix)
-                          + jitter_pix + piezo_settling_pix)
+            jitter_pix = max(self.ao.s2p(29e-6), 1) # Maybe as low as 27 us?
+            piezo_settling_pix = self.ao.s2p(0.000) # Not yet measured
+            period_pix = (max(exp_pix, roll_pix, piezo_settling_pix)
+                          + jitter_pix)
             piezo_voltage_limit = 150 # 15 um for current piezo
             piezo_voltage_step = 2 # 200 nm steps
             n2c = self.names_to_voltage_channels # A temporary nickname
@@ -204,7 +205,7 @@ class Snoutscope:
             for piezo_voltage in np.arange(
                 0, piezo_voltage_limit+piezo_voltage_step, piezo_voltage_step):
                 v = np.zeros((period_pix, self.ao.num_channels), 'float64')
-                v[:roll_pix, n2c['camera']] = 5 # falling edge -> laser on
+                v[:roll_pix, n2c['camera']] = 5
                 v[:, n2c['snoutfocus_piezo']] = 10*(piezo_voltage /
                                                     piezo_voltage_limit) # 10 V
                 voltages.append(v)
@@ -213,7 +214,7 @@ class Snoutscope:
             # Allocate memory and finalize microscope settings:
             data_buffer = self._get_data_buffer(
                 (exposures_per_buffer, self.camera.height, self.camera.width),
-                'uint16')
+                'uint16') # TODO: effectively a min size for data buffers!
             self.snoutfocus_controller._finish_set_voltage()
             self.filter_wheel._finish_moving()
             # Take pictures while moving the snoutfocus piezo:
@@ -225,6 +226,8 @@ class Snoutscope:
             camera_thread.start()
             self.ao.play_voltages(voltages, block=False) # Ends at 0 V
             camera_thread.join()
+            if timestamp_mode != "off":
+                data_buffer[:,0:8,:] = 0
             # Inspect the images to find and set best piezo position:
             if np.max(data_buffer) < 5 * np.min(data_buffer):
                 print('WARNING: snoutfocus laser intensity is low:',
@@ -236,7 +239,7 @@ class Snoutscope:
                 print('WARNING: snoutfocus piezo is out of range!')
             self.snoutfocus_controller.set_voltage(
                 controller_voltage, block=False)
-            if verbose: print('Snoutfocus piezo voltage =', controller_voltage)
+            print('Snoutfocus piezo voltage =', controller_voltage)
             # Clean up after ourselves:
             self.filter_wheel.move(old_filter_wheel_position,
                                    speed=6, block=False)
@@ -244,8 +247,8 @@ class Snoutscope:
             self.camera._set_roi(old_roi)
             self.camera._set_exposure_time(old_exp_us)
             self.camera.arm(16)
-            self.filter_wheel._finish_moving()
             self.snoutfocus_controller._finish_set_voltage()
+            self.filter_wheel._finish_moving()
             self._settings_are_sane = True
             custody.switch_from(self.camera, to=None)
             if filename is not None:
@@ -692,15 +695,15 @@ class Preprocessor:
 if __name__ == '__main__':
     # Set variables: tzcyx acquisition
     # Illumination and emission:
-    ch_per_slice = ["LED"] # pick any number and order
-    pwr_per_ch = {"LED" : 50} # set power for each channel
-    fw_pos = 1 # pick 1 filter wheel position per buffer/ao play:
+    ch_per_slice = ("LED", "488") # pick any number and order
+    pwr_per_ch = (50, 10) # set power for each channel
+    fw_pos = 3 # pick 1 filter wheel position per buffer/ao play:
     # 0:blocked, 1:open, 2:ET450/50M, 3:ET525/50M, 4:ET600/50M, 5:ET690/50M
     # 6:ZETquadM
 
     # Scan settings:
     aspect_ratio = 8 # 2 about right for Nyquist?
-    scan_range_um = 50
+    scan_range_um = 25
     
     # Camera chip cropping and exposure time:
     crop_pix_lr = 500
@@ -711,7 +714,7 @@ if __name__ == '__main__':
     vol_per_buffer = 1
     num_data_buffers = 3 # increase for multiprocessing
     num_snap = 2 # interbuffer time limited by ao play
-    delay_s = 0 # insert delay for time series
+    delay_s = 3.1 # insert delay for time series
     t_stamp = "off"
 
     # Calculate bytes_per_buffer for precise memory allocation:
@@ -740,7 +743,6 @@ if __name__ == '__main__':
     focus_piezo_position_um = (scope.focus_piezo.get_real_position())
     XY_stage_position_mm = scope.XY_stage.get_position()
     
-
     scope.apply_settings( # Mandatory call
         roi=roi,
         scan_step_size_um=scan_step_size_um,
@@ -762,15 +764,15 @@ if __name__ == '__main__':
 
     # Start frames-per-second timer: acquire, display and save
     for i in range(num_snap):
-        start = time.perf_counter()
-##        scope.snoutfocus(verbose=True).join()
+##        start = time.perf_counter()
+##        scope.snoutfocus(filename='snoutfocus_series%i.tif'%i).join()
 ##        print('snoutfocus time (s):', (time.perf_counter() - start))
         scope.snap(
             display=True,
-##            filename='test_images\%06i.tif'%i, # comment out to avoid,
+            filename='test_images\%06i.tif'%i, # comment out to avoid,
             delay_seconds=delay_s
             )
-        t_stamp = "binary+ASCII"
-        scope.apply_settings(timestamp_mode=t_stamp)
-    
+##        t_stamp = "binary+ASCII"
+##        scope.apply_settings(timestamp_mode=t_stamp)
+
     scope.close()
