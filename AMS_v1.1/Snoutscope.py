@@ -36,8 +36,8 @@ class Snoutscope:
         bytes_per_preview_buffer,
         ):
         """
-        We use bytes_per_buffer to specify the shared_memory_sizes for the
-        child processes.
+        We use bytes_per_buffer and bytes_per_preview_buffer to specify
+        the shared_memory_sizes for the child processes.
         """
         # TODO: Think about an elegant solution for printing and threading
         self._init_shared_memory(
@@ -61,11 +61,17 @@ class Snoutscope:
         slow_snoutfocus_init.join()
         slow_camera_init.join()
         slow_fw_init.join()
-        self.run_snoutfocus(re_apply_settings=False, # False as no settings yet
-                            filesave=True, # Save first stack for inspection
-                            verbose=True) # Look at piezo voltage
+        # TODO: Does this belong in init? I think it maybe belongs in
+        # the init of the GUI? Or the acquisition script? I can imagine
+        # cases where you want to skip this.
+        self.snoutfocus(filename='snoutfocus_series.tif', # Save for inspection
+                        verbose=True) # Look at piezo voltage
         print('Finished initializing Snoutscope')
+        # Note: snoutfocus task is probably still running
         # Note: you still have to call .apply_settings() before you can .snap()
+
+    #TODO: Put all the methods we want people to actually use up front
+    #here. Apply settings, snap, snoutfocus, finish_all_tasks, close.
 
     def _init_shared_memory(
         self,
@@ -94,17 +100,18 @@ class Snoutscope:
 
     def _init_ao(self):
         self.names_to_voltage_channels = {
-            'camera':0,
-            'galvo' :4,
-            'LED_power':12, 
-            '405_TTL':16,
-            '405_power':17,
-            '488_TTL':20,
-            '488_power':21,
-            '561_TTL':24,
-            '561_power':25,
-            '640_TTL':28,
-            '640_power':29,}
+            'camera': 0,
+            'galvo': 4,
+            'snoutfocus_piezo': 6,
+            'LED_power': 12, 
+            '405_TTL': 16,
+            '405_power': 17,
+            '488_TTL': 20,
+            '488_power': 21,
+            '561_TTL': 24,
+            '561_power': 25,
+            '640_TTL': 28,
+            '640_power': 29,}
         print("Initializing ao card...", end=' ')
         self.ao = ni.Analog_Out(num_channels=30,
                                 rate=1e5,
@@ -118,7 +125,8 @@ class Snoutscope:
         print("Initializing filter wheel...")
         self.filter_wheel = sutter.Lambda_10_3(which_port='COM3', verbose=False)
         print("done with filter wheel.")
-        atexit.register(self.filter_wheel.close) # does not execute?
+        self.filter_wheel_position = 0
+        atexit.register(self.filter_wheel.close)
 
     def _init_camera(self):
         print("Initializing camera... (this sometimes hangs)")
@@ -156,64 +164,68 @@ class Snoutscope:
         self.display = display(proxy_manager=self.pm)
         print("done with display.")
 
-    def run_snoutfocus(
+    def snoutfocus(
         self,
-        delay_s=None,
-        re_apply_settings=True,
-        filesave=False,
-        verbose=False):
+        delay_seconds=None,
+        filename=None,
+        verbose=False,
+        ):
         def snoutfocus_task(custody):
-    
-            # TODO: reduce latency from re_apply_settings (currently ~700ms)
             custody.switch_from(None, to=self.camera) # safe to change settings
 ############# TODO: this is currently BROKEN HERE:
-            # we need to add this delay but have custody conflicts...
-            if delay_seconds is not None:
+            # Is it actually broken? I'm not sure it is.
+            # TODO: take a deterministic amount of time?
+            if delay_seconds is not None and delay_seconds > 2:
                 time.sleep(delay_seconds - 2) # snoutfocus < 2 seconds to run
-############# 
+#############
             self._settings_are_sane = False # In case the thread crashes
-            self.filter_wheel.move(1, speed=6, block=False) # empty slot
-            self.snoutfocus_controller.set_voltage(
-                0, block=False) # reset before ao play!
-            if re_apply_settings:
-                roi = self.camera._get_roi()
-                exp_us = self.camera._get_exposure_time()
-            self.camera.apply_settings(
-                trigger='external_trigger',
-                exposure_time_microseconds=100, # adjust as needed
-                region_of_interest={'left': 901, 'top': 901, # reduce for speed
-                                    'right': 1160, 'bottom': 1148}) 
+            # Record the settings we'll have to reset:
+            old_filter_wheel_position = self.filter_wheel_position
+            old_roi = self.camera._get_roi()
+            old_exp_us = self.camera._get_exposure_time()
+            # Get microscope settings ready to take our measurement:
+            self.filter_wheel.move(1, speed=6, block=False) # Empty slot
+            self.snoutfocus_controller.set_voltage(0, block=False)
+            self.camera.disarm()
+            self.camera._set_roi({'left': 901, 'top': 901, # reduce for speed
+                                  'right': 1160, 'bottom': 1148})
+            self.camera._set_exposure_time(100) # Microseconds
+            # Calculate voltages for the analog-out card:
             exp_pix = self.ao.s2p(1e-6*self.camera.exposure_time_microseconds)
             roll_pix = self.ao.s2p(1e-6*self.camera.rolling_time_microseconds)
-            jitter_pix = max(self.ao.s2p(30e-6), 1) # Maybe as low as 30us?
-            piezo_settle_pix = self.ao.s2p(0.000) # ms?
+            jitter_pix = max(self.ao.s2p(30e-6), 1) # Maybe as low as 30 us?
+            piezo_settling_pix = self.ao.s2p(0.000) # ~1 ms?
             period_pix = (max(exp_pix, roll_pix)
-                          + jitter_pix + piezo_settle_pix)
-            piezo_voltage_limit = 150 # 15um for current piezo
-            piezo_voltage_step = 2 # 200nm steps
-            ao_voltage_series = []
-            for v in range(0,
-                           piezo_voltage_limit + piezo_voltage_step,
-                           piezo_voltage_step):
-                volt_period = np.zeros(
-                    (period_pix, self.ao.num_channels), 'float64')
-                volt_period[:roll_pix, 0] = 5 # falling edge -> laser on
-                volt_period[:, 6] = 10 * (v / piezo_voltage_limit) # 0-10v
-                ao_voltage_series.append(volt_period)
-            ao_voltages = np.concatenate(ao_voltage_series, axis=0)
-            num_img = len(ao_voltage_series)
+                          + jitter_pix + piezo_settling_pix)
+            piezo_voltage_limit = 150 # 15 um for current piezo
+            piezo_voltage_step = 2 # 200 nm steps
+            n2c = self.names_to_voltage_channels # A temporary nickname
+            voltages = []
+            for piezo_voltage in np.arange(
+                0, piezo_voltage_limit+piezo_voltage_step, piezo_voltage_step):
+                v = np.zeros((period_pix, self.ao.num_channels), 'float64')
+                v[:roll_pix, n2c['camera']] = 5 # falling edge -> laser on
+                v[:, n2c['snoutfocus_piezo']] = 10*(piezo_voltage /
+                                                    piezo_voltage_limit) # 10 V
+                voltages.append(v)
+            exposures_per_buffer = len(voltages)
+            voltages = np.concatenate(voltages, axis=0)
+            # Allocate memory and finalize microscope settings:
             data_buffer = self._get_data_buffer(
-                (num_img, self.camera.height, self.camera.width), 'uint16')
-            self.camera.arm(16) # re-arm after apply_settings (max 16 buffers)
+                (exposures_per_buffer, self.camera.height, self.camera.width),
+                'uint16')
             self.snoutfocus_controller._finish_set_voltage()
             self.filter_wheel._finish_moving()
-            self.ao.play_voltages(ao_voltages, # Race condition!
-                                  block=False,
-                                  force_final_zeros=True) # leave piezo at 0v
-            # TODO: consider re-using thread format from snap method
-            self.camera.record_to_memory(num_images=num_img, out=data_buffer)
-            if filesave:
-                imwrite('snoutfocus_series.tif', data_buffer[:,np.newaxis,:,:])
+            # Take pictures while moving the snoutfocus piezo:
+            camera_thread = threading.Thread(
+                target=self.camera.record_to_memory,
+                args=(exposures_per_buffer,),
+                kwargs={'out': data_buffer,
+                        'first_trigger_timeout_seconds': 10},)
+            camera_thread.start()
+            self.ao.play_voltages(voltages, block=False) # Ends at 0 V
+            camera_thread.join()
+            # Inspect the images to find and set best piezo position:
             if np.max(data_buffer) < 5 * np.min(data_buffer):
                 print('WARNING: snoutfocus laser intensity is low:',
                       'is the laser/shutter powered up?')
@@ -224,20 +236,21 @@ class Snoutscope:
                 print('WARNING: snoutfocus piezo is out of range!')
             self.snoutfocus_controller.set_voltage(
                 controller_voltage, block=False)
-            if verbose: 
-                print('Snoutfocus piezo voltage =', controller_voltage)
-            self._release_data_buffer(data_buffer)
-            if re_apply_settings: # must re_apply to restore hardware settings
-                self.filter_wheel.move(self.filter_wheel_position,
-                                       speed=6, block=False)
-                self.camera.apply_settings(trigger='external_trigger',
-                                           exposure_time_microseconds=exp_us,
-                                           region_of_interest=roi)
-                self.camera.arm(16)                
-                self.filter_wheel._finish_moving()
+            if verbose: print('Snoutfocus piezo voltage =', controller_voltage)
+            # Clean up after ourselves:
+            self.filter_wheel.move(old_filter_wheel_position,
+                                   speed=6, block=False)
+            self.camera.disarm()
+            self.camera._set_roi(old_roi)
+            self.camera._set_exposure_time(old_exp_us)
+            self.camera.arm(16)
+            self.filter_wheel._finish_moving()
             self.snoutfocus_controller._finish_set_voltage()
             self._settings_are_sane = True
             custody.switch_from(self.camera, to=None)
+            if filename is not None:
+                imwrite(filename, data_buffer[:, np.newaxis, :, :])
+            self._release_data_buffer(data_buffer)
         snoutfocus_thread = proxy_objects.launch_custody_thread(
             target=snoutfocus_task, first_resource=self.camera)
         self.unfinished_tasks.put(snoutfocus_thread)
@@ -251,8 +264,6 @@ class Snoutscope:
         volumes_per_buffer=None,
         slices_per_volume=None,
         channels_per_slice=None,
-## TODO: change power_per_channel from dict to iterable
-##       + add special 405_on_during_rolling time.
         power_per_channel=None,
         filter_wheel_position=None,
         focus_piezo_position_um=None,
@@ -262,7 +273,7 @@ class Snoutscope:
         ''' Apply any settings to the scope that need to be configured before
             acquring an image. Think filter wheel position, stage position,
             camera settings, light intensity, calculate daq voltages, etc.'''
-        # TODO: input sanitization
+        # TODO: input sanitization?
         args = locals()
         args.pop('self')
         def settings_task(custody):
@@ -317,15 +328,14 @@ class Snoutscope:
         # We'll use this a lot, so a short nickname is nice:
         n2c = self.names_to_voltage_channels
         # Input sanitization
-        illumination_sources = ('LED', '405', '488', '561', '640')
-        for ch in self.channels_per_slice:
-            assert ch in illumination_sources
+        illumination_sources = ('LED', '405', '488', '561', '640',
+                                '405_on_during_rolling')
+        for channel in self.channels_per_slice:
+            assert channel in illumination_sources
         assert len(self.channels_per_slice) > 0
-        for ch in illumination_sources:
-            if ch in self.power_per_channel: # Ensure sane limits
-                assert 0 <= self.power_per_channel[ch] <= 100
-            else: # ...or else a sane default: small but nonzero.
-                self.power_per_channel[ch] = 10
+        assert len(self.power_per_channel) == len(self.channels_per_slice)
+        for power in self.power_per_channel:
+            assert 0 <= power <= 100
         assert self.slices_per_volume == int(self.slices_per_volume)
         assert self.slices_per_volume > 0
         assert self.volumes_per_buffer == int(self.volumes_per_buffer)
@@ -352,19 +362,24 @@ class Snoutscope:
         for vo in range(self.volumes_per_buffer):
             # TODO: either bidirectional volumes, or smoother galvo flyback
             for sl in range(self.slices_per_volume):
-                for ch in self.channels_per_slice:
+                for ch, pw in zip(self.channels_per_slice,
+                                  self.power_per_channel):
                     v = np.zeros((period_pix, self.ao.num_channels), 'float64')
                     # Camera trigger:
                     v[:rolling_pix, n2c['camera']] = 5 # falling edge->light on!
                     # Galvo step:
                     v[:, n2c['galvo']] = galvo_voltages[sl] # galvo
+                    if channel in ('405_on_during_rolling',):
+                        light_on_pix = 0
+                    else:
+                        light_on_pix = rolling_pix
                     # Illumination TTL trigger:
                     if ch != 'LED': # i.e. the laser channels
-                        v[rolling_pix:period_pix - jitter_pix,
+                        v[light_on_pix:period_pix - jitter_pix,
                           n2c[ch + '_TTL']] = 3
                     # Illumination power modulation:
-                    v[rolling_pix:period_pix - jitter_pix,
-                      n2c[ch + '_power']] = 4.5 * self.power_per_channel[ch]/100
+                    v[light_on_pix:period_pix - jitter_pix,
+                      n2c[ch + '_power']] = 4.5 * pw / 100
                     voltages.append(v)
         self.voltages = np.concatenate(voltages, axis=0)
 
@@ -383,7 +398,7 @@ class Snoutscope:
 
     def snap(self, display=True, filename=None, delay_seconds=None):
         if delay_seconds is not None and delay_seconds > 3:
-            self.run_snoutfocus(delay_seconds)
+            self.snoutfocus(delay_seconds)
             delay_seconds = None
         def snap_task(custody):
             custody.switch_from(None, to=self.camera)
@@ -748,7 +763,7 @@ if __name__ == '__main__':
     # Start frames-per-second timer: acquire, display and save
     for i in range(num_snap):
         start = time.perf_counter()
-##        scope.run_snoutfocus(verbose=True).join()
+##        scope.snoutfocus(verbose=True).join()
 ##        print('snoutfocus time (s):', (time.perf_counter() - start))
         scope.snap(
             display=True,
