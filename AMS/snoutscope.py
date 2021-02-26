@@ -8,7 +8,7 @@ import queue
 # Third party imports, installable via pip:
 import numpy as np
 from scipy.ndimage import zoom, rotate
-from tifffile import imwrite
+from tifffile import imread, imwrite
 # import matplotlib
 # We only import matplotlib if/when we call Snoutscope._plot_voltages()
 
@@ -66,17 +66,17 @@ class Snoutscope:
 
     def apply_settings(
         self,
-        roi=None,
-        scan_step_size_um=None,
-        illumination_time_microseconds=None,
-        volumes_per_buffer=None,
-        slices_per_volume=None,
-        channels_per_slice=None,
-        power_per_channel=None,
-        filter_wheel_position=None,
-        focus_piezo_position_um=None,
-        XY_stage_position_mm=None,
-        timestamp_mode=None,
+        roi=None, # Dict, see pco.py ._set_roi()
+        scan_step_size_um=None, # Float
+        illumination_time_microseconds=None, # Float
+        volumes_per_buffer=None, # Int
+        slices_per_volume=None,  # Int
+        channels_per_slice=None, # Tuple of strings
+        power_per_channel=None,  # Tuple of floats
+        filter_wheel_position=None, # Int
+        focus_piezo_position_um=None, # Float
+        XY_stage_position_mm=None, # (Float, Float, optional: "relative")
+        timestamp_mode=None, # String, see pco.py ._set_timestamp_mode()
         ):
         ''' Apply any settings to the scope that need to be configured before
             acquring an image. Think filter wheel position, stage position,
@@ -95,9 +95,14 @@ class Snoutscope:
                     'Attribute %s must be set by apply_settings()'%k)
             # Send hardware commands, slowest to fastest:
             if XY_stage_position_mm is not None:
-                self.XY_stage.move(XY_stage_position_mm[0],
-                                   XY_stage_position_mm[1],
-                                   blocking=False)
+                x, y = XY_stage_position_mm[0:2]
+                # Absolute position, or relative motion?
+                if len(XY_stage_position_mm) > 2:
+                    move_type = XY_stage_position[2]
+                    assert move_type == "relative"
+                    x0, y0 = self.XY_stage.get_position()
+                    x, y = x0+x, y0+y
+                self.XY_stage.move(x, y, blocking=False)
             if filter_wheel_position is not None:
                 self.filter_wheel.move(filter_wheel_position,
                                        speed=6,
@@ -313,6 +318,72 @@ class Snoutscope:
             target=snoutfocus_task, first_resource=self.camera)
         self.unfinished_tasks.put(snoutfocus_thread)
         return snoutfocus_thread
+
+    def spiral_tiling_preview(
+        self,
+        num_spirals=1,
+        dx_mm=0.1,
+        dy_mm=0.1,
+        ):
+        ####################
+        # WORK IN PROGRESS #
+        ####################
+        # TODO: xy, or yx? What's stage leftright vs. screen leftright?
+        # If we get this straight, this code will suck less.
+        assert num_spirals < 5 # C'mon don't be silly, this is still a lot
+        filename = "spiral_preview_%02i_%02i.tif"
+        ix, iy = [0], [0] # Mutable, integer coords relative to starting tile
+        def move(x, y):
+            ix[0], iy[0] = ix[0]+x, iy[0]+y
+            self.apply_settings(
+                XY_stage_position_mm=(dx_mm*x, dy_mm*y, "relative"))
+            self.snap(
+                filename=filename%(ix[0]+num_spirals, iy[0]+num_spirals),
+                display=True)
+        def move_up():    move( 0,  1)
+        def move_down():  move( 0, -1)
+        def move_left():  move(-1,  0)
+        def move_right(): move( 1,  0)
+        for which_spiral in range(num_spirals): # This took me a while...
+            for i in range(1):
+                move_up()
+            for i in range(1 + 2*which_spiral):
+                move_right()
+            for i in range(2 + 2*which_spiral):
+                move_down()
+            for i in range(2 + 2*which_spiral):
+                move_left()
+            for i in range(2 + 2*which_spiral):
+                move_up()
+        last_snap_task = self.unfinished_tasks[-1]
+        self.apply_settings( # Return to original position
+            XY_stage_position_mm=(-dx_mm*ix[0], -dy_mm*iy[0], "relative"))
+        def display_preview_task(custody):
+            # You can't display until the preview files have saved to disk:
+            last_snap_task.join() # TODO: should I join them all? Probably.
+            # Now you can start to reload the preview images:
+            first_tile = tifffile.imread(filename%(0, 0))
+            ud_pix, lr_pix = first_tile.shape[-2:]
+            preview_shape = list(first_tile.shape)
+            preview_shape[-2] = ud_pix * (1 + 2*num_spirals)
+            preview_shape[-1] = lr_pix * (1 + 2*num_spirals)
+            # We're ready to hog some shared resources:
+            preview_buffer = self._get_preview_buffer(preview_shape, 'uint16')
+            preview_buffer[..., :ud_pix, :lr_pix] = first_tile
+            for i in range(1 + 2*num_spirals):
+                for j in range(1 + 2*num_spirals):
+                    if i, j == 0, 0: continue # We already did this tile
+                    preview_buffer[...,
+                                   ud_pix*j:ud_pix*(j+1),
+                                   lr_pix*i:lr_pix*(i+1)
+                                   ] = tifffile.imread(filename%(i, j))
+            custody.switch_from(None, to=self.display)
+            self.display.show_image(preview_buffer)
+            custody.switch_from(self.display, to=None)
+            self._release_preview_buffer(preview_buffer)
+        display_thread = proxy_objects.launch_custody_thread(
+            target=display_preview_task, first_resource=self.display)
+        self.unfinished_tasks.put(display_thread)
 
     def finish_all_tasks(self):
         collected_tasks = []
