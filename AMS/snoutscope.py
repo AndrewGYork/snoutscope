@@ -10,7 +10,7 @@ import numpy as np
 from scipy.ndimage import zoom, rotate
 from tifffile import imwrite
 # import matplotlib
-# We only import matplotlib if/when we call Snoutscope.plot_voltages()
+# We only import matplotlib if/when we call Snoutscope._plot_voltages()
 
 # Our stuff, from github.com/AndrewGYork/tools. Don't pip install.
 # One .py file per module, copy files to your local directory.
@@ -61,107 +61,162 @@ class Snoutscope:
         slow_snoutfocus_init.join()
         slow_camera_init.join()
         slow_fw_init.join()
-        # TODO: Does this belong in init? I think it maybe belongs in
-        # the init of the GUI? Or the acquisition script? I can imagine
-        # cases where you want to skip this.
-        self.snoutfocus(filename='snoutfocus_series.tif') # Save for inspection
         print('Finished initializing Snoutscope')
-        # Note: snoutfocus task is probably still running
         # Note: you still have to call .apply_settings() before you can .snap()
 
-    #TODO: Put all the methods we want people to actually use up front
-    #here. Apply settings, snap, snoutfocus, finish_all_tasks, close.
-
-    def _init_shared_memory(
+    def apply_settings(
         self,
-        bytes_per_data_buffer,
-        num_data_buffers,
-        bytes_per_preview_buffer,
+        roi=None,
+        scan_step_size_um=None,
+        illumination_time_microseconds=None,
+        volumes_per_buffer=None,
+        slices_per_volume=None,
+        channels_per_slice=None,
+        power_per_channel=None,
+        filter_wheel_position=None,
+        focus_piezo_position_um=None,
+        XY_stage_position_mm=None,
+        timestamp_mode=None,
         ):
-        """
-        Each buffer is acquired in deterministic time with a single play
-        of the ao card.
-        """
-        num_preview_buffers = 3 # 3 for preprocess, display and filesave
-        assert bytes_per_data_buffer > 0 and num_data_buffers > 0
-        assert bytes_per_preview_buffer > 0
-        print("Allocating shared memory...", end=' ')
-        self.pm = proxy_objects.ProxyManager(shared_memory_sizes=(
-            (bytes_per_data_buffer,   ) * num_data_buffers +
-            (bytes_per_preview_buffer,) * num_preview_buffers))
-        print("done allocating memory.")
-        self.data_buffer_queue = queue.Queue(maxsize=num_data_buffers)
-        for i in range(num_data_buffers):
-            self.data_buffer_queue.put(i)
-        self.preview_buffer_queue = queue.Queue(maxsize=num_preview_buffers)
-        for i in range(num_preview_buffers):
-            self.preview_buffer_queue.put(i + num_data_buffers) # pointer math!
+        ''' Apply any settings to the scope that need to be configured before
+            acquring an image. Think filter wheel position, stage position,
+            camera settings, light intensity, calculate daq voltages, etc.'''
+        # TODO: input sanitization?
+        args = locals()
+        args.pop('self')
+        def settings_task(custody):
+            custody.switch_from(None, to=self.camera)
+            # We own the camera, safe to change settings
+            self._settings_are_sane = False # In case the thread crashes
+            if filter_wheel_position is not None:
+                self.filter_wheel.move(filter_wheel_position,
+                                       speed=6,
+                                       block=False)
+            if focus_piezo_position_um is not None:
+                self.focus_piezo.move(focus_piezo_position_um) # nonblocking
+            if XY_stage_position_mm is not None:
+                self.XY_stage.move(XY_stage_position_mm[0],
+                                   XY_stage_position_mm[1],
+                                   blocking=False)
+            if (roi is not None or
+                illumination_time_microseconds is not None or
+                timestamp_mode is not None):
+                self.camera.disarm()
+                if roi is not None: self.camera._set_roi(roi)
+                if illumination_time_microseconds is not None:
+                    illumination_us = illumination_time_microseconds
+                else:
+                    illumination_us = self.illumination_time_microseconds
+                self.camera._set_exposure_time(
+                    illumination_us + self.camera.rolling_time_microseconds)
+                if timestamp_mode is not None:
+                    self.camera._set_timestamp_mode(timestamp_mode)
+                self.camera.arm(16)
+            # Attributes must be set previously or currently:
+            for k, v in args.items(): 
+                if v is not None:
+                    setattr(self, k, v) # A lot like self.x = x
+                assert hasattr(self, k), (
+                    'Attribute %s must be set by apply_settings()'%k)
+            self._calculate_voltages()
+            if XY_stage_position_mm is not None:
+                self.XY_stage.finish_moving()
+            if focus_piezo_position_um is not None:
+                self.focus_piezo._finish_moving()
+            if filter_wheel_position is not None:
+                self.filter_wheel._finish_moving()
+            self._settings_are_sane = True
+            custody.switch_from(self.camera, to=None)
+        settings_thread = proxy_objects.launch_custody_thread(
+            target=settings_task, first_resource=self.camera)
+        self.unfinished_tasks.put(settings_thread)
+        return settings_thread
 
-    def _init_ao(self):
-        self.names_to_voltage_channels = {
-            'camera': 0,
-            'galvo': 4,
-            'snoutfocus_piezo': 6,
-            'LED_power': 12, 
-            '405_TTL': 16,
-            '405_power': 17,
-            '488_TTL': 20,
-            '488_power': 21,
-            '561_TTL': 24,
-            '561_power': 25,
-            '640_TTL': 28,
-            '640_power': 29,}
-        print("Initializing ao card...", end=' ')
-        self.ao = ni.Analog_Out(num_channels=30,
-                                rate=1e5,
-                                daq_type='6739',
-                                board_name='PXI1Slot2',
-                                verbose=False)
-        print("done with ao.")
-        atexit.register(self.ao.close)
-
-    def _init_filter_wheel(self):
-        print("Initializing filter wheel...")
-        self.filter_wheel = sutter.Lambda_10_3(which_port='COM3', verbose=False)
-        print("done with filter wheel.")
-        self.filter_wheel_position = 0
-        atexit.register(self.filter_wheel.close)
-
-    def _init_camera(self):
-        print("Initializing camera... (this sometimes hangs)")
-        self.camera = self.pm.proxy_object(pco.Camera, verbose=False,
-                                           close_method_name='close')
-        self.camera.apply_settings(trigger='external_trigger')
-        print("done with camera.")
-
-    def _init_snoutfocus(self):
-        print("Initializing snoutfocus piezo...")
-        self.snoutfocus_controller = thorlabs.MDT694B_piezo_controller(
-            which_port='COM7', verbose=False)
-        print("done with snoutfocus piezo.")
-        atexit.register(self.snoutfocus_controller.close)
-
-    def _init_focus_piezo(self):
-        print("Initializing focus piezo...")
-        self.focus_piezo = pi.E753_Z_Piezo(which_port='COM6', verbose=False)
-        print("done with focus piezo.")
-        atexit.register(self.focus_piezo.close)
-
-    def _init_XY_stage(self):
-        print("Initializing XY stage...")
-        self.XY_stage = pi.C867_XY_Stage(which_port='COM5', verbose=False)
-        print("done with XY stage.")
-        atexit.register(self.XY_stage.close)
-
-    def _init_preprocessor(self):
-        print("Initializing preprocessor...")
-        self.preprocessor = self.pm.proxy_object(Preprocessor)
-        print("done with preprocessor.")
-
-    def _init_display(self):
-        print("Initializing display...")
-        self.display = display(proxy_manager=self.pm)
-        print("done with display.")
+    def snap(self, display=True, filename=None, delay_seconds=None):
+        if delay_seconds is not None and delay_seconds > 3:
+            self.snoutfocus(delay_seconds)
+            delay_seconds = None
+        def snap_task(custody):
+            custody.switch_from(None, to=self.camera)
+            if delay_seconds is not None:
+                time.sleep(delay_seconds) # simple but not precise
+            assert hasattr(self, '_settings_are_sane'), (
+                'Please call .apply_settings() before using .snap()')
+            assert self._settings_are_sane, (
+                'Did .apply_settings() fail? Please call it again.')
+            exposures_per_buffer = (len(self.channels_per_slice) *
+                                    self.slices_per_volume *
+                                    self.volumes_per_buffer)
+            data_buffer = self._get_data_buffer(
+                (exposures_per_buffer, self.camera.height, self.camera.width),
+                'uint16')
+            # It would be nice if record_to_memory() wasn't blocking,
+            # but we'll use a thread for now.
+            camera_thread = threading.Thread(
+                target=self.camera.record_to_memory,
+                args=(exposures_per_buffer,),
+                kwargs={'out': data_buffer,
+                        'first_trigger_timeout_seconds': 10},)
+            camera_thread.start()
+            # There's a race here. The PCO camera starts with N empty
+            # single-frame buffers (typically 16), which are filled by
+            # the triggers sent by ao.play_voltages(). The camera_thread
+            # empties them, hopefully fast enough that we never run out.
+            # So far, the camera_thread seems to both start on time, and
+            # keep up reliably once it starts, but this could be
+            # fragile.
+            self.ao.play_voltages(self.voltages, block=False)
+            ## TODO: consider finished playing all voltages before moving on...
+            camera_thread.join()
+            # Acquisition is 3D, but display and filesaving are 5D:
+            data_buffer = data_buffer.reshape(self.volumes_per_buffer,
+                                              self.slices_per_volume,
+                                              len(self.channels_per_slice),
+                                              data_buffer.shape[-2],
+                                              data_buffer.shape[-1])
+            if display:
+                # We still have custody of the camera so attribute
+                # access is safe:
+                scan_step_size_um = self.scan_step_size_um
+                prev_shape = (
+                    (self.volumes_per_buffer,
+                     len(self.channels_per_slice),) + 
+                    Preprocessor.three_traditional_projections_shape(
+                    self.slices_per_volume,
+                    data_buffer.shape[-2],
+                    data_buffer.shape[-1],
+                    scan_step_size_um))
+                custody.switch_from(self.camera, to=self.preprocessor)
+                preview_buffer = self._get_preview_buffer(prev_shape, 'uint16')
+                for vo in range(data_buffer.shape[0]):
+                    for ch in range(data_buffer.shape[2]):
+                        self.preprocessor.three_traditional_projections(
+                            data_buffer[vo, :, ch, :, :],
+                            scan_step_size_um,
+                            out=preview_buffer[vo, ch, :, :])
+                custody.switch_from(self.preprocessor, to=self.display)
+                self.display.show_image(preview_buffer)
+                custody.switch_from(self.display, to=None)
+                if filename is not None:
+                    root, ext = os.path.splitext(filename)
+                    preview_filename = root + '_preview' + ext
+                    print("Saving file", preview_filename, end=' ')
+                    imwrite(preview_filename, preview_buffer, imagej=True)
+                    print("done.")
+                self._release_preview_buffer(preview_buffer)
+            else:
+                custody.switch_from(self.camera, to=None)
+            # TODO: if file saving turns out to disrupt other activities
+            # in the main process, make a FileSaving proxy object.
+            if filename is not None:
+                print("Saving file", filename, end=' ')
+                imwrite(filename, data_buffer, imagej=True)
+                print("done.")
+            self._release_data_buffer(data_buffer)
+        snap_thread = proxy_objects.launch_custody_thread(
+            target=snap_task, first_resource=self.camera)
+        self.unfinished_tasks.put(snap_thread)
+        return snap_thread
 
     def snoutfocus(
         self,
@@ -259,73 +314,122 @@ class Snoutscope:
         self.unfinished_tasks.put(snoutfocus_thread)
         return snoutfocus_thread
 
-    def apply_settings(
+    def finish_all_tasks(self):
+        collected_tasks = []
+        while True:
+            try:
+                th = self.unfinished_tasks.get_nowait()
+            except queue.Empty:
+                break
+            th.join()
+            collected_tasks.append(th)
+        return collected_tasks
+
+    def quit(self):
+        self.ao.close()
+        self.filter_wheel.close()
+        self.camera.close()
+        self.snoutfocus_controller.close()
+        self.focus_piezo.close()
+        self.XY_stage.close()
+        self.display.close() # more work needed here
+        print('Quit Snoutscope')
+
+    def close(self):
+        self.finish_all_tasks()
+        self.quit()
+        print('Closed Snoutscope')
+
+    def _init_shared_memory(
         self,
-        roi=None,
-        scan_step_size_um=None,
-        illumination_time_microseconds=None,
-        volumes_per_buffer=None,
-        slices_per_volume=None,
-        channels_per_slice=None,
-        power_per_channel=None,
-        filter_wheel_position=None,
-        focus_piezo_position_um=None,
-        XY_stage_position_mm=None,
-        timestamp_mode=None,
+        bytes_per_data_buffer,
+        num_data_buffers,
+        bytes_per_preview_buffer,
         ):
-        ''' Apply any settings to the scope that need to be configured before
-            acquring an image. Think filter wheel position, stage position,
-            camera settings, light intensity, calculate daq voltages, etc.'''
-        # TODO: input sanitization?
-        args = locals()
-        args.pop('self')
-        def settings_task(custody):
-            custody.switch_from(None, to=self.camera)
-            # We own the camera, safe to change settings
-            self._settings_are_sane = False # In case the thread crashes
-            if filter_wheel_position is not None:
-                self.filter_wheel.move(filter_wheel_position,
-                                       speed=6,
-                                       block=False)
-            if focus_piezo_position_um is not None:
-                self.focus_piezo.move(focus_piezo_position_um) # nonblocking
-            if XY_stage_position_mm is not None:
-                self.XY_stage.move(XY_stage_position_mm[0],
-                                   XY_stage_position_mm[1],
-                                   blocking=False)
-            if (roi is not None or
-                illumination_time_microseconds is not None or
-                timestamp_mode is not None):
-                self.camera.disarm()
-                if roi is not None: self.camera._set_roi(roi)
-                if illumination_time_microseconds is not None:
-                    illumination_us = illumination_time_microseconds
-                else:
-                    illumination_us = self.illumination_time_microseconds
-                self.camera._set_exposure_time(
-                    illumination_us + self.camera.rolling_time_microseconds)
-                if timestamp_mode is not None:
-                    self.camera._set_timestamp_mode(timestamp_mode)
-                self.camera.arm(16)
-            # Attributes must be set previously or currently:
-            for k, v in args.items(): 
-                if v is not None:
-                    setattr(self, k, v) # A lot like self.x = x
-                assert hasattr(self, k), (
-                    'Attribute %s must be set by apply_settings()'%k)
-            self._calculate_voltages()
-            if XY_stage_position_mm is not None:
-                self.XY_stage.finish_moving()
-            if focus_piezo_position_um is not None:
-                self.focus_piezo._finish_moving()
-            if filter_wheel_position is not None:
-                self.filter_wheel._finish_moving()
-            self._settings_are_sane = True
-            custody.switch_from(self.camera, to=None)
-        settings_thread = proxy_objects.launch_custody_thread(
-            target=settings_task, first_resource=self.camera)
-        self.unfinished_tasks.put(settings_thread)
-        return settings_thread
+        """
+        Each buffer is acquired in deterministic time with a single play
+        of the ao card.
+        """
+        num_preview_buffers = 3 # 3 for preprocess, display and filesave
+        assert bytes_per_data_buffer > 0 and num_data_buffers > 0
+        assert bytes_per_preview_buffer > 0
+        print("Allocating shared memory...", end=' ')
+        self.pm = proxy_objects.ProxyManager(shared_memory_sizes=(
+            (bytes_per_data_buffer,   ) * num_data_buffers +
+            (bytes_per_preview_buffer,) * num_preview_buffers))
+        print("done allocating memory.")
+        self.data_buffer_queue = queue.Queue(maxsize=num_data_buffers)
+        for i in range(num_data_buffers):
+            self.data_buffer_queue.put(i)
+        self.preview_buffer_queue = queue.Queue(maxsize=num_preview_buffers)
+        for i in range(num_preview_buffers):
+            self.preview_buffer_queue.put(i + num_data_buffers) # pointer math!
+
+    def _init_ao(self):
+        self.names_to_voltage_channels = {
+            'camera': 0,
+            'galvo': 4,
+            'snoutfocus_piezo': 6,
+            'LED_power': 12, 
+            '405_TTL': 16,
+            '405_power': 17,
+            '488_TTL': 20,
+            '488_power': 21,
+            '561_TTL': 24,
+            '561_power': 25,
+            '640_TTL': 28,
+            '640_power': 29,}
+        print("Initializing ao card...", end=' ')
+        self.ao = ni.Analog_Out(num_channels=30,
+                                rate=1e5,
+                                daq_type='6739',
+                                board_name='PXI1Slot2',
+                                verbose=False)
+        print("done with ao.")
+        atexit.register(self.ao.close)
+
+    def _init_filter_wheel(self):
+        print("Initializing filter wheel...")
+        self.filter_wheel = sutter.Lambda_10_3(which_port='COM3', verbose=False)
+        print("done with filter wheel.")
+        self.filter_wheel_position = 0
+        atexit.register(self.filter_wheel.close)
+
+    def _init_camera(self):
+        print("Initializing camera... (this sometimes hangs)")
+        self.camera = self.pm.proxy_object(pco.Camera, verbose=False,
+                                           close_method_name='close')
+        self.camera.apply_settings(trigger='external_trigger')
+        print("done with camera.")
+
+    def _init_snoutfocus(self):
+        print("Initializing snoutfocus piezo...")
+        self.snoutfocus_controller = thorlabs.MDT694B_piezo_controller(
+            which_port='COM7', verbose=False)
+        print("done with snoutfocus piezo.")
+        atexit.register(self.snoutfocus_controller.close)
+
+    def _init_focus_piezo(self):
+        print("Initializing focus piezo...")
+        self.focus_piezo = pi.E753_Z_Piezo(which_port='COM6', verbose=False)
+        print("done with focus piezo.")
+        atexit.register(self.focus_piezo.close)
+
+    def _init_XY_stage(self):
+        print("Initializing XY stage...")
+        self.XY_stage = pi.C867_XY_Stage(which_port='COM5', verbose=False)
+        print("done with XY stage.")
+        atexit.register(self.XY_stage.close)
+
+    def _init_preprocessor(self):
+        print("Initializing preprocessor...")
+        self.preprocessor = self.pm.proxy_object(Preprocessor)
+        print("done with preprocessor.")
+
+    def _init_display(self):
+        print("Initializing display...")
+        self.display = display(proxy_manager=self.pm)
+        print("done with display.")
 
     def _calculate_voltages(self):
         # We'll use this a lot, so a short nickname is nice:
@@ -386,7 +490,7 @@ class Snoutscope:
                     voltages.append(v)
         self.voltages = np.concatenate(voltages, axis=0)
 
-    def plot_voltages(self):
+    def _plot_voltages(self):
         import matplotlib.pyplot as plt
         # Reverse lookup table; channel numbers to names:
         c2n = {v:k for k, v in self.names_to_voltage_channels.items()}
@@ -398,92 +502,6 @@ class Snoutscope:
         plt.ylabel('Volts')
         plt.xlabel('Seconds')
         plt.show()
-
-    def snap(self, display=True, filename=None, delay_seconds=None):
-        if delay_seconds is not None and delay_seconds > 3:
-            self.snoutfocus(delay_seconds)
-            delay_seconds = None
-        def snap_task(custody):
-            custody.switch_from(None, to=self.camera)
-            if delay_seconds is not None:
-                time.sleep(delay_seconds) # simple but not precise
-            assert hasattr(self, '_settings_are_sane'), (
-                'Please call .apply_settings() before using .snap()')
-            assert self._settings_are_sane, (
-                'Did .apply_settings() fail? Please call it again.')
-            exposures_per_buffer = (len(self.channels_per_slice) *
-                                    self.slices_per_volume *
-                                    self.volumes_per_buffer)
-            data_buffer = self._get_data_buffer(
-                (exposures_per_buffer, self.camera.height, self.camera.width),
-                'uint16')
-            # It would be nice if record_to_memory() wasn't blocking,
-            # but we'll use a thread for now.
-            camera_thread = threading.Thread(
-                target=self.camera.record_to_memory,
-                args=(exposures_per_buffer,),
-                kwargs={'out': data_buffer,
-                        'first_trigger_timeout_seconds': 10},)
-            camera_thread.start()
-            # There's a race here. The PCO camera starts with N empty
-            # single-frame buffers (typically 16), which are filled by
-            # the triggers sent by ao.play_voltages(). The camera_thread
-            # empties them, hopefully fast enough that we never run out.
-            # So far, the camera_thread seems to both start on time, and
-            # keep up reliably once it starts, but this could be
-            # fragile.
-            self.ao.play_voltages(self.voltages, block=False)
-            ## TODO: consider finished playing all voltages before moving on...
-            camera_thread.join()
-            # Acquisition is 3D, but display and filesaving are 5D:
-            data_buffer = data_buffer.reshape(self.volumes_per_buffer,
-                                              self.slices_per_volume,
-                                              len(self.channels_per_slice),
-                                              data_buffer.shape[-2],
-                                              data_buffer.shape[-1])
-            if display:
-                # We still have custody of the camera so attribute
-                # access is safe:
-                scan_step_size_um = self.scan_step_size_um
-                prev_shape = (
-                    (self.volumes_per_buffer,
-                     len(self.channels_per_slice),) + 
-                    Preprocessor.three_traditional_projections_shape(
-                    self.slices_per_volume,
-                    data_buffer.shape[-2],
-                    data_buffer.shape[-1],
-                    scan_step_size_um))
-                custody.switch_from(self.camera, to=self.preprocessor)
-                preview_buffer = self._get_preview_buffer(prev_shape, 'uint16')
-                for vo in range(data_buffer.shape[0]):
-                    for ch in range(data_buffer.shape[2]):
-                        self.preprocessor.three_traditional_projections(
-                            data_buffer[vo, :, ch, :, :],
-                            scan_step_size_um,
-                            out=preview_buffer[vo, ch, :, :])
-                custody.switch_from(self.preprocessor, to=self.display)
-                self.display.show_image(preview_buffer)
-                custody.switch_from(self.display, to=None)
-                if filename is not None:
-                    root, ext = os.path.splitext(filename)
-                    preview_filename = root + '_preview' + ext
-                    print("Saving file", preview_filename, end=' ')
-                    imwrite(preview_filename, preview_buffer, imagej=True)
-                    print("done.")
-                self._release_preview_buffer(preview_buffer)
-            else:
-                custody.switch_from(self.camera, to=None)
-            # TODO: if file saving turns out to disrupt other activities
-            # in the main process, make a FileSaving proxy object.
-            if filename is not None:
-                print("Saving file", filename, end=' ')
-                imwrite(filename, data_buffer, imagej=True)
-                print("done.")
-            self._release_data_buffer(data_buffer)
-        snap_thread = proxy_objects.launch_custody_thread(
-            target=snap_task, first_resource=self.camera)
-        self.unfinished_tasks.put(snap_thread)
-        return snap_thread
 
     def _get_data_buffer(self, shape, dtype):
         which_mp_array = self.data_buffer_queue.get()
@@ -521,31 +539,6 @@ class Snoutscope:
         which_mp_array = shared_numpy_array.buffer
         self.preview_buffer_queue.put(which_mp_array)
 
-    def finish_all_tasks(self):
-        collected_tasks = []
-        while True:
-            try:
-                th = self.unfinished_tasks.get_nowait()
-            except queue.Empty:
-                break
-            th.join()
-            collected_tasks.append(th)
-        return collected_tasks
-
-    def quit(self):
-        self.ao.close()
-        self.filter_wheel.close()
-        self.camera.close()
-        self.snoutfocus_controller.close()
-        self.focus_piezo.close()
-        self.XY_stage.close()
-        self.display.close() # more work needed here
-        print('Quit Snoutscope')
-
-    def close(self):
-        self.finish_all_tasks()
-        self.quit()
-        print('Closed Snoutscope')
 
 def legalize_voxel_aspect_ratio(aspect_ratio):
     return max(int(round(aspect_ratio / np.tan(tilt))), 1) * np.tan(tilt)
@@ -760,7 +753,7 @@ if __name__ == '__main__':
     buffer_time = scope.ao.p2s(scope.voltages.shape[0])
 
     # Optionally, show voltages. Useful for debugging.
-##    scope.plot_voltages()
+##    scope._plot_voltages()
 
     # Start frames-per-second timer: acquire, display and save
     for i in range(num_snap):
