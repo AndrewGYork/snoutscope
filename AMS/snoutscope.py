@@ -176,20 +176,24 @@ class Snoutscope:
             if display:
                 # We have custody of the camera so attribute access is safe:
                 scan_step_size_um = self.scan_step_size_um
+                if self.timestamp_mode == "off":
+                    preview_me = data_buffer
+                else: # Ignore the top 8 rows so timestamps don't dominate:
+                    preview_me = data_buffer[:, :, :, 8:, :]
                 prev_shape = (
                     (self.volumes_per_buffer,
-                     len(self.channels_per_slice),) + 
+                     len(self.channels_per_slice),) +
                     Preprocessor.three_traditional_projections_shape(
-                    self.slices_per_volume,
-                    data_buffer.shape[-2],
-                    data_buffer.shape[-1],
-                    scan_step_size_um))
+                        self.slices_per_volume,
+                        preview_me.shape[-2],
+                        preview_me.shape[-1],
+                        scan_step_size_um))
                 custody.switch_from(self.camera, to=self.preprocessor)
                 preview_buffer = self._get_preview_buffer(prev_shape, 'uint16')
-                for vo in range(data_buffer.shape[0]):
-                    for ch in range(data_buffer.shape[2]):
+                for vo in range(preview_me.shape[0]):
+                    for ch in range(preview_me.shape[2]):
                         self.preprocessor.three_traditional_projections(
-                            data_buffer[vo, :, ch, :, :],
+                            preview_me[vo, :, ch, :, :],
                             scan_step_size_um,
                             out=preview_buffer[vo, ch, :, :])
                 custody.switch_from(self.preprocessor, to=self.display)
