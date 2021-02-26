@@ -17,7 +17,7 @@ from tifffile import imwrite
 import pco # Install PCO's SDK to get relevant DLLs
 import ni # Install NI-DAQmx to get relevant DLLs
 import sutter
-import physik_instrumente as pi
+import physik_instrumente as p_i
 import thorlabs
 import proxy_objects
 from proxied_napari import display
@@ -81,50 +81,49 @@ class Snoutscope:
         ''' Apply any settings to the scope that need to be configured before
             acquring an image. Think filter wheel position, stage position,
             camera settings, light intensity, calculate daq voltages, etc.'''
-        # TODO: input sanitization?
         args = locals()
         args.pop('self')
         def settings_task(custody):
             custody.switch_from(None, to=self.camera)
             # We own the camera, safe to change settings
             self._settings_are_sane = False # In case the thread crashes
-            if filter_wheel_position is not None:
-                self.filter_wheel.move(filter_wheel_position,
-                                       speed=6,
-                                       block=False)
-            if focus_piezo_position_um is not None:
-                self.focus_piezo.move(focus_piezo_position_um) # nonblocking
-            if XY_stage_position_mm is not None:
-                self.XY_stage.move(XY_stage_position_mm[0],
-                                   XY_stage_position_mm[1],
-                                   blocking=False)
-            if (roi is not None or
-                illumination_time_microseconds is not None or
-                timestamp_mode is not None):
-                self.camera.disarm()
-                if roi is not None: self.camera._set_roi(roi)
-                if illumination_time_microseconds is not None:
-                    illumination_us = illumination_time_microseconds
-                else:
-                    illumination_us = self.illumination_time_microseconds
-                self.camera._set_exposure_time(
-                    illumination_us + self.camera.rolling_time_microseconds)
-                if timestamp_mode is not None:
-                    self.camera._set_timestamp_mode(timestamp_mode)
-                self.camera.arm(16)
             # Attributes must be set previously or currently:
             for k, v in args.items(): 
                 if v is not None:
                     setattr(self, k, v) # A lot like self.x = x
                 assert hasattr(self, k), (
                     'Attribute %s must be set by apply_settings()'%k)
-            self._calculate_voltages()
+            # Send hardware commands, slowest to fastest:
             if XY_stage_position_mm is not None:
-                self.XY_stage.finish_moving()
+                self.XY_stage.move(XY_stage_position_mm[0],
+                                   XY_stage_position_mm[1],
+                                   blocking=False)
+            if filter_wheel_position is not None:
+                self.filter_wheel.move(filter_wheel_position,
+                                       speed=6,
+                                       block=False)
+            if focus_piezo_position_um is not None:
+                self.focus_piezo.move(focus_piezo_position_um) # nonblocking
+            if (roi is not None or
+                illumination_time_microseconds is not None or
+                timestamp_mode is not None):
+                self.camera.disarm()
+                if roi is not None: self.camera._set_roi(roi)
+                if (roi, illumination_time_microseconds) != (None, None):
+                    self.camera._set_exposure_time(
+                        self.illumination_time_microseconds +
+                        self.camera.rolling_time_microseconds)
+                if timestamp_mode is not None:
+                    self.camera._set_timestamp_mode(timestamp_mode)
+                self.camera.arm(16)
+            self._calculate_voltages()
+            # Finalize hardware commands, fastest to slowest:
             if focus_piezo_position_um is not None:
                 self.focus_piezo._finish_moving()
             if filter_wheel_position is not None:
                 self.filter_wheel._finish_moving()
+            if XY_stage_position_mm is not None:
+                self.XY_stage.finish_moving()
             self._settings_are_sane = True
             custody.switch_from(self.camera, to=None)
         settings_thread = proxy_objects.launch_custody_thread(
@@ -134,7 +133,7 @@ class Snoutscope:
 
     def snap(self, display=True, filename=None, delay_seconds=None):
         if delay_seconds is not None and delay_seconds > 3:
-            self.snoutfocus(delay_seconds)
+            self.snoutfocus(delay_seconds=delay_seconds) # Might as well!
             delay_seconds = None
         def snap_task(custody):
             custody.switch_from(None, to=self.camera)
@@ -143,15 +142,15 @@ class Snoutscope:
             assert hasattr(self, '_settings_are_sane'), (
                 'Please call .apply_settings() before using .snap()')
             assert self._settings_are_sane, (
-                'Did .apply_settings() fail? Please call it again.')
+                'Did .apply_settings() fail? Please call it again, ' +
+                'with all arguments specified.')
             exposures_per_buffer = (len(self.channels_per_slice) *
                                     self.slices_per_volume *
                                     self.volumes_per_buffer)
             data_buffer = self._get_data_buffer(
                 (exposures_per_buffer, self.camera.height, self.camera.width),
                 'uint16')
-            # It would be nice if record_to_memory() wasn't blocking,
-            # but we'll use a thread for now.
+            # camera.record_to_memory() blocks, so we use a thread:
             camera_thread = threading.Thread(
                 target=self.camera.record_to_memory,
                 args=(exposures_per_buffer,),
@@ -175,8 +174,7 @@ class Snoutscope:
                                               data_buffer.shape[-2],
                                               data_buffer.shape[-1])
             if display:
-                # We still have custody of the camera so attribute
-                # access is safe:
+                # We have custody of the camera so attribute access is safe:
                 scan_step_size_um = self.scan_step_size_um
                 prev_shape = (
                     (self.volumes_per_buffer,
@@ -218,19 +216,13 @@ class Snoutscope:
         self.unfinished_tasks.put(snap_thread)
         return snap_thread
 
-    def snoutfocus(
-        self,
-        delay_seconds=None,
-        filename=None,
-        ):
+    def snoutfocus(self, filename=None, delay_seconds=None):
         def snoutfocus_task(custody):
             custody.switch_from(None, to=self.camera) # safe to change settings
-############# TODO: this is currently BROKEN HERE:
-            # Is it actually broken? I'm not sure it is.
-            # TODO: take a deterministic amount of time?
-            if delay_seconds is not None and delay_seconds > 2:
-                time.sleep(delay_seconds - 2) # snoutfocus < 2 seconds to run
-#############
+            if delay_seconds is not None:
+                start_time = time.perf_counter()
+                if delay_seconds > 3: # 3 seconds is def. enough time to focus
+                    time.sleep(delay_seconds - 3)
             self._settings_are_sane = False # In case the thread crashes
             # Record the settings we'll have to reset:
             old_filter_wheel_position = self.filter_wheel_position
@@ -281,23 +273,23 @@ class Snoutscope:
             camera_thread.start()
             self.ao.play_voltages(voltages, block=False) # Ends at 0 V
             camera_thread.join()
-            if timestamp_mode != "off":
-                data_buffer[:,0:8,:] = 0
-            # Inspect the images to find and set best piezo position:
-            if np.max(data_buffer) < 5 * np.min(data_buffer):
+            # Start cleaning up after ourselves:
+            self.filter_wheel.move(old_filter_wheel_position,
+                                   speed=6, block=False)
+            # Inspect the images to find/set best snoutfocus piezo position:
+            inspect_me = data_buffer[:, 8:0, :] # Top rows might have timestamps
+            if np.max(inspect_me) < 5 * np.min(inspect_me):
                 print('WARNING: snoutfocus laser intensity is low:',
                       'is the laser/shutter powered up?')
             controller_voltage = piezo_voltage_step * np.unravel_index(
-                np.argmax(data_buffer), data_buffer.shape)[0]
+                np.argmax(inspect_me), inspect_me.shape)[0]
             if (controller_voltage == 0 or
                 controller_voltage == piezo_voltage_limit):
                 print('WARNING: snoutfocus piezo is out of range!')
             self.snoutfocus_controller.set_voltage(
                 controller_voltage, block=False)
             print('Snoutfocus piezo voltage =', controller_voltage)
-            # Clean up after ourselves:
-            self.filter_wheel.move(old_filter_wheel_position,
-                                   speed=6, block=False)
+            # Finish cleaning up after ourselves:
             self.camera.disarm()
             self.camera._set_roi(old_roi)
             self.camera._set_exposure_time(old_exp_us)
@@ -305,6 +297,10 @@ class Snoutscope:
             self.snoutfocus_controller._finish_set_voltage()
             self.filter_wheel._finish_moving()
             self._settings_are_sane = True
+            # We might want to hold camera custody for a fixed amount of time:
+            if delay_seconds is not None:
+                while time.perf_counter() - start_time < delay_seconds:
+                    time.sleep(0.001)
             custody.switch_from(self.camera, to=None)
             if filename is not None:
                 imwrite(filename, data_buffer[:, np.newaxis, :, :])
@@ -325,19 +321,16 @@ class Snoutscope:
             collected_tasks.append(th)
         return collected_tasks
 
-    def quit(self):
+    def close(self, finish_all_tasks=True):
+        if finish_all_tasks:
+            self.finish_all_tasks()
         self.ao.close()
         self.filter_wheel.close()
         self.camera.close()
         self.snoutfocus_controller.close()
         self.focus_piezo.close()
         self.XY_stage.close()
-        self.display.close() # more work needed here
-        print('Quit Snoutscope')
-
-    def close(self):
-        self.finish_all_tasks()
-        self.quit()
+        self.display.close()
         print('Closed Snoutscope')
 
     def _init_shared_memory(
@@ -411,13 +404,13 @@ class Snoutscope:
 
     def _init_focus_piezo(self):
         print("Initializing focus piezo...")
-        self.focus_piezo = pi.E753_Z_Piezo(which_port='COM6', verbose=False)
+        self.focus_piezo = p_i.E753_Z_Piezo(which_port='COM6', verbose=False)
         print("done with focus piezo.")
         atexit.register(self.focus_piezo.close)
 
     def _init_XY_stage(self):
         print("Initializing XY stage...")
-        self.XY_stage = pi.C867_XY_Stage(which_port='COM5', verbose=False)
+        self.XY_stage = p_i.C867_XY_Stage(which_port='COM5', verbose=False)
         print("done with XY stage.")
         atexit.register(self.XY_stage.close)
 
