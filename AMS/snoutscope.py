@@ -181,10 +181,10 @@ class Snoutscope:
             if display:
                 # We have custody of the camera so attribute access is safe:
                 scan_step_size_um = self.scan_step_size_um
-                if self.timestamp_mode == "off":
-                    preview_me = data_buffer
-                else: # Ignore the top 8 rows so timestamps don't dominate:
-                    preview_me = data_buffer[:, :, :, 8:, :]
+                skip_rows = 0
+                if self.timestamp_mode != "off":
+                    skip_rows = 8 # Ignore rows so timestamps don't dominate
+                preview_me = data_buffer[:, :, :, skip_rows:, :]
                 prev_shape = (
                     (self.volumes_per_buffer,
                      len(self.channels_per_slice),) +
@@ -198,7 +198,7 @@ class Snoutscope:
                 for vo in range(preview_me.shape[0]):
                     for ch in range(preview_me.shape[2]):
                         self.preprocessor.three_traditional_projections(
-                            preview_me[vo, :, ch, :, :],
+                            data_buffer[vo, :, ch, skip_rows:, :],
                             scan_step_size_um,
                             out=preview_buffer[vo, ch, :, :])
                 custody.switch_from(self.preprocessor, to=self.display)
@@ -286,7 +286,7 @@ class Snoutscope:
             self.filter_wheel.move(old_filter_wheel_position,
                                    speed=6, block=False)
             # Inspect the images to find/set best snoutfocus piezo position:
-            inspect_me = data_buffer[:, 8:0, :] # Top rows might have timestamps
+            inspect_me = data_buffer[:, 8:, :] # Top rows might have timestamps
             if np.max(inspect_me) < 5 * np.min(inspect_me):
                 print('WARNING: snoutfocus laser intensity is low:',
                       'is the laser/shutter powered up?')
@@ -372,7 +372,7 @@ class Snoutscope:
             preview_buffer[..., :ud_pix, :lr_pix] = first_tile
             for i in range(1 + 2*num_spirals):
                 for j in range(1 + 2*num_spirals):
-                    if i, j == 0, 0: continue # We already did this tile
+                    if (i, j) == (0, 0): continue # We already did this tile
                     preview_buffer[...,
                                    ud_pix*j:ud_pix*(j+1),
                                    lr_pix*i:lr_pix*(i+1)
@@ -775,7 +775,7 @@ if __name__ == '__main__':
     vol_per_buffer = 1
     num_data_buffers = 3 # increase for multiprocessing
     num_snap = 2 # interbuffer time limited by ao play
-    delay_s = 3.1 # insert delay for time series
+    delay_s = 0 # insert delay for time series
     t_stamp = "off"
 
     # Calculate bytes_per_buffer for precise memory allocation:
@@ -825,15 +825,15 @@ if __name__ == '__main__':
 
     # Start frames-per-second timer: acquire, display and save
     for i in range(num_snap):
-##        start = time.perf_counter()
-##        scope.snoutfocus(filename='snoutfocus_series%i.tif'%i).join()
-##        print('snoutfocus time (s):', (time.perf_counter() - start))
+        start = time.perf_counter()
+        scope.snoutfocus(filename='snoutfocus_series%i.tif'%i).join()
+        print('snoutfocus time (s):', (time.perf_counter() - start))
         scope.snap(
             display=True,
             filename='test_images\%06i.tif'%i, # comment out to avoid,
             delay_seconds=delay_s
             )
-##        t_stamp = "binary+ASCII"
-##        scope.apply_settings(timestamp_mode=t_stamp)
+        t_stamp = "binary+ASCII"
+        scope.apply_settings(timestamp_mode=t_stamp)
 
     scope.close()
