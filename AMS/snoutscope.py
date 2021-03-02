@@ -67,14 +67,14 @@ class Snoutscope:
     def apply_settings(
         self,
         roi=None, # Dict, see pco.py ._set_roi()
-        scan_step_size_um=None, # Float
+        shear_px_per_scan_step=None, # Int (or Float but be careful!)
         illumination_time_microseconds=None, # Float
         volumes_per_buffer=None, # Int
         slices_per_volume=None,  # Int
         channels_per_slice=None, # Tuple of strings
         power_per_channel=None,  # Tuple of floats
         filter_wheel_position=None, # Int
-        focus_piezo_position_um=None, # Float
+        focus_piezo_position_um=None, # Float or (Float, "relative")
         XY_stage_position_mm=None, # (Float, Float, optional: "relative")
         timestamp_mode=None, # String, see pco.py ._set_timestamp_mode()
         ):
@@ -108,7 +108,13 @@ class Snoutscope:
                                        speed=6,
                                        block=False)
             if focus_piezo_position_um is not None:
-                self.focus_piezo.move(focus_piezo_position_um) # nonblocking
+                try: # Absolute position?
+                    z = float(focus_piezo_position_um)
+                except TypeError: # Relative position?
+                    assert focus_piezo_position_um[1] == "relative"
+                    z = (float(focus_piezo_position_um[0]) +
+                         self.focus_piezo.get_real_position())
+                self.focus_piezo.move(z) # nonblocking
             if (roi is not None or
                 illumination_time_microseconds is not None or
                 timestamp_mode is not None):
@@ -524,6 +530,10 @@ class Snoutscope:
         period_pix = max(exposure_pix, rolling_pix) + jitter_pix
 
         # Calculate galvo voltages from volume settings:
+        self.voxel_aspect_ratio = self.shear_px_per_scan_step * np.tan(tilt)
+        self.scan_step_size_um = (
+            self.voxel_aspect_ratio * sample_px_um / np.sin(tilt))
+        
         scan_range_um = self.scan_step_size_um * (self.slices_per_volume - 1)
         assert 0 <= scan_range_um <= 201 # optical limit
         galvo_volts_per_um = 4.5 / 110 # calibrated using graticule
@@ -764,6 +774,7 @@ if __name__ == '__main__':
 
     # Scan settings:
     aspect_ratio = 8 # 2 about right for Nyquist?
+    shear_px_per_scan_step = 2
     scan_range_um = 25
     
     # Camera chip cropping and exposure time:
@@ -806,7 +817,7 @@ if __name__ == '__main__':
     
     scope.apply_settings( # Mandatory call
         roi=roi,
-        scan_step_size_um=scan_step_size_um,
+        shear_px_per_scan_step=shear_px_per_scan_step,
         illumination_time_microseconds=ill_time_us,
         volumes_per_buffer=vol_per_buffer,
         slices_per_volume=slices_per_vol,
