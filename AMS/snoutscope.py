@@ -98,7 +98,7 @@ class Snoutscope:
                 x, y = XY_stage_position_mm[0:2]
                 # Absolute position, or relative motion?
                 if len(XY_stage_position_mm) > 2:
-                    move_type = XY_stage_position[2]
+                    move_type = XY_stage_position_mm[2]
                     assert move_type == "relative"
                     x0, y0 = self.XY_stage.get_position()
                     x, y = x0+x, y0+y
@@ -336,20 +336,25 @@ class Snoutscope:
         ####################
         # TODO: xy, or yx? What's stage leftright vs. screen leftright?
         # If we get this straight, this code will suck less.
-        assert num_spirals < 5 # C'mon don't be silly, this is still a lot
-        filename = "spiral_preview_%02i_%02i.tif"
+## TODO: - make sure stage is at max velocity and then return
+        assert dx_mm and dy_mm < 1
+        assert num_spirals < 4 # C'mon don't be silly, this is still a lot
+        data_filename = "spiral_%02i_%02i.tif"
+        preview_filename = "spiral_%02i_%02i_preview.tif"
         ix, iy = [0], [0] # Mutable, integer coords relative to starting tile
+        snap_tasks = []
         def move(x, y):
             ix[0], iy[0] = ix[0]+x, iy[0]+y
             self.apply_settings(
                 XY_stage_position_mm=(dx_mm*x, dy_mm*y, "relative"))
-            self.snap(
-                filename=filename%(ix[0]+num_spirals, iy[0]+num_spirals),
-                display=True)
+            snap_tasks.append(self.snap(
+                filename=data_filename%(ix[0]+num_spirals, iy[0]+num_spirals),
+                display=True))
         def move_up():    move( 0,  1)
         def move_down():  move( 0, -1)
         def move_left():  move(-1,  0)
         def move_right(): move( 1,  0)
+        move(0, 0) # get the central tile
         for which_spiral in range(num_spirals): # This took me a while...
             for i in range(1):
                 move_up()
@@ -361,19 +366,25 @@ class Snoutscope:
                 move_left()
             for i in range(2 + 2*which_spiral):
                 move_up()
-        last_snap_task = self.unfinished_tasks[-1]
         self.apply_settings( # Return to original position
             XY_stage_position_mm=(-dx_mm*ix[0], -dy_mm*iy[0], "relative"))
         def display_preview_task(custody):
+            # To preserve order we follow the same custody pattern as snap():
+            custody.switch_from(None, to=self.camera)
+            custody.switch_from(self.camera, to=self.preprocessor)
+            custody.switch_from(self.preprocessor, to=self.display)
             # You can't display until the preview files have saved to disk:
-            last_snap_task.join() # TODO: should I join them all? Probably.
+            for st in snap_tasks: st.join()
             # Now you can start to reload the preview images:
-            first_tile = tifffile.imread(filename%(0, 0))
+            # TODO: re-try (with small delay) if file not found yet?
+            first_tile = imread(preview_filename%(0, 0))
             ud_pix, lr_pix = first_tile.shape[-2:]
             preview_shape = list(first_tile.shape)
             preview_shape[-2] = ud_pix * (1 + 2*num_spirals)
             preview_shape[-1] = lr_pix * (1 + 2*num_spirals)
             # We're ready to hog some shared resources:
+            # TODO: seriously consider adding spiral_preview_buffers to avoid
+            # asking for memory that's not available
             preview_buffer = self._get_preview_buffer(preview_shape, 'uint16')
             preview_buffer[..., :ud_pix, :lr_pix] = first_tile
             for i in range(1 + 2*num_spirals):
@@ -382,13 +393,12 @@ class Snoutscope:
                     preview_buffer[...,
                                    ud_pix*j:ud_pix*(j+1),
                                    lr_pix*i:lr_pix*(i+1)
-                                   ] = tifffile.imread(filename%(i, j))
-            custody.switch_from(None, to=self.display)
+                                   ] = imread(preview_filename%(i, j))
             self.display.show_image(preview_buffer)
             custody.switch_from(self.display, to=None)
             self._release_preview_buffer(preview_buffer)
         display_thread = proxy_objects.launch_custody_thread(
-            target=display_preview_task, first_resource=self.display)
+            target=display_preview_task, first_resource=self.camera)
         self.unfinished_tasks.put(display_thread)
 
     def finish_all_tasks(self):
@@ -773,14 +783,16 @@ if __name__ == '__main__':
     # 6:ZETquadM
 
     # Scan settings:
+## TODO: figure out how to remove aspect_ratio and deliver slices per volume
+## from scan_range_um
     aspect_ratio = 8 # 2 about right for Nyquist?
-    shear_px_per_scan_step = 2
+    shear_px_per_scan_step = 10
     scan_range_um = 25
     
     # Camera chip cropping and exposure time:
     crop_pix_lr = 500
-    crop_pix_ud = 900 # max 1019
-    ill_time_us = 1000 # global exposure
+    crop_pix_ud = 500 # max 1019
+    ill_time_us = 100 # global exposure
 
     # Acquisition:
     vol_per_buffer = 1
@@ -788,6 +800,7 @@ if __name__ == '__main__':
     num_snap = 2 # interbuffer time limited by ao play
     delay_s = 0 # insert delay for time series
     t_stamp = "off"
+    max_spiral_tiles = 49
 
     # Calculate bytes_per_buffer for precise memory allocation:
     roi = pco.legalize_roi({'left': 1 + crop_pix_lr,
@@ -799,6 +812,7 @@ if __name__ == '__main__':
     h_px = roi['bottom'] - roi['top'] + 1
     slices_per_vol, scan_step_size_um = legalize_scan(
         aspect_ratio, scan_range_um)
+    
     legal_aspect_ratio = legalize_voxel_aspect_ratio(aspect_ratio)
     images_per_buffer = vol_per_buffer * slices_per_vol * len(ch_per_slice)
     bytes_per_data_buffer = images_per_buffer * h_px * w_px * 2
@@ -807,7 +821,7 @@ if __name__ == '__main__':
         slices_per_vol, h_px, w_px, scan_step_size_um)
     
     bytes_per_preview_buffer = vol_per_buffer * len(ch_per_slice) * int(
-        np.prod(projection_shape)) * 2
+        np.prod(projection_shape)) * 2 * max_spiral_tiles
 
     # Create scope object:
     scope = Snoutscope(
@@ -835,16 +849,18 @@ if __name__ == '__main__':
 ##    scope._plot_voltages()
 
     # Start frames-per-second timer: acquire, display and save
-    for i in range(num_snap):
-        start = time.perf_counter()
-        scope.snoutfocus(filename='snoutfocus_series%i.tif'%i).join()
-        print('snoutfocus time (s):', (time.perf_counter() - start))
-        scope.snap(
-            display=True,
-            filename='test_images\%06i.tif'%i, # comment out to avoid,
-            delay_seconds=delay_s
-            )
-        t_stamp = "binary+ASCII"
-        scope.apply_settings(timestamp_mode=t_stamp)
+##    for i in range(num_snap):
+##        start = time.perf_counter()
+##        scope.snoutfocus(filename='snoutfocus_series%i.tif'%i).join()
+##        print('snoutfocus time (s):', (time.perf_counter() - start))
+##        scope.snap(
+##            display=True,
+##            filename='test_images\%06i.tif'%i, # comment out to avoid,
+##            delay_seconds=delay_s
+##            )
+##        t_stamp = "binary+ASCII"
+##        scope.apply_settings(timestamp_mode=t_stamp)
+
+    scope.spiral_tiling_preview(num_spirals=1, dx_mm=0.01, dy_mm=0.01)
 
     scope.close()
