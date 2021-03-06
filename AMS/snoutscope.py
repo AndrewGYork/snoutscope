@@ -28,6 +28,23 @@ MRR = M1 * Mscan * M2; Mtot = MRR * M3;
 camera_px_um = 6.5; sample_px_um = camera_px_um / Mtot
 tilt = np.deg2rad(30)
 
+# Snoutscope definitions:
+def calculate_scan_step_size_um(scan_step_size_px):
+    return scan_step_size_px * sample_px_um / np.cos(tilt)
+
+def calculate_scan_range_um(scan_step_size_px, slices_per_volume):
+    scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
+    return scan_step_size_um * (slices_per_volume - 1)
+
+def calculate_voxel_aspect_ratio(scan_step_size_px):
+    return scan_step_size_px * np.tan(tilt)
+
+def calculate_cuboid_voxel_scan(voxel_aspect_ratio, scan_range_um):
+    scan_step_size_px = max(int(round(voxel_aspect_ratio / np.tan(tilt))), 1)
+    scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
+    slices_per_volume = 1 + int(round(scan_range_um / scan_step_size_um))
+    return scan_step_size_px, slices_per_volume # watch out for fencepost!
+
 class Snoutscope:
     def __init__(
         self,
@@ -67,7 +84,7 @@ class Snoutscope:
     def apply_settings(
         self,
         roi=None, # Dict, see pco.py ._set_roi()
-        shear_px_per_scan_step=None, # Int (or Float but be careful!)
+        scan_step_size_px=None, # Int (or Float but be careful!)
         illumination_time_microseconds=None, # Float
         volumes_per_buffer=None, # Int
         slices_per_volume=None,  # Int
@@ -96,10 +113,8 @@ class Snoutscope:
             # Send hardware commands, slowest to fastest:
             if XY_stage_position_mm is not None:
                 x, y = XY_stage_position_mm[0:2]
-                # Absolute position, or relative motion?
-                if len(XY_stage_position_mm) > 2:
-                    move_type = XY_stage_position_mm[2]
-                    assert move_type == "relative"
+                if len(XY_stage_position_mm) > 2: # Relative motion?
+                    assert XY_stage_position_mm[2] == "relative"
                     x0, y0 = self.XY_stage.get_position()
                     x, y = x0+x, y0+y
                 self.XY_stage.move(x, y, blocking=False)
@@ -186,7 +201,7 @@ class Snoutscope:
                                               data_buffer.shape[-1])
             if display:
                 # We have custody of the camera so attribute access is safe:
-                scan_step_size_um = self.scan_step_size_um
+                scan_step_size_px = self.scan_step_size_px
                 skip_rows = 0
                 if self.timestamp_mode != "off":
                     skip_rows = 8 # Ignore rows so timestamps don't dominate
@@ -198,14 +213,14 @@ class Snoutscope:
                         self.slices_per_volume,
                         preview_me.shape[-2],
                         preview_me.shape[-1],
-                        scan_step_size_um))
+                        scan_step_size_px))
                 custody.switch_from(self.camera, to=self.preprocessor)
                 preview_buffer = self._get_preview_buffer(prev_shape, 'uint16')
                 for vo in range(preview_me.shape[0]):
                     for ch in range(preview_me.shape[2]):
                         self.preprocessor.three_traditional_projections(
                             data_buffer[vo, :, ch, skip_rows:, :],
-                            scan_step_size_um,
+                            scan_step_size_px,
                             out=preview_buffer[vo, ch, :, :])
                 custody.switch_from(self.preprocessor, to=self.display)
                 self.display.show_image(preview_buffer)
@@ -292,12 +307,12 @@ class Snoutscope:
             self.filter_wheel.move(old_filter_wheel_position,
                                    speed=6, block=False)
             # Inspect the images to find/set best snoutfocus piezo position:
-            inspect_me = data_buffer[:, 8:, :] # Top rows might have timestamps
-            if np.max(inspect_me) < 5 * np.min(inspect_me):
+            # Top rows might have timestamps
+            if np.max(data_buffer[:,8:,:]) < 5 * np.min(data_buffer[:,8:,:]):
                 print('WARNING: snoutfocus laser intensity is low:',
                       'is the laser/shutter powered up?')
             controller_voltage = piezo_voltage_step * np.unravel_index(
-                np.argmax(inspect_me), inspect_me.shape)[0]
+                np.argmax(data_buffer[:,8:,:]), data_buffer[:,8:,:].shape)[0]
             if (controller_voltage == 0 or
                 controller_voltage == piezo_voltage_limit):
                 print('WARNING: snoutfocus piezo is out of range!')
@@ -539,13 +554,12 @@ class Snoutscope:
         jitter_pix = max(self.ao.s2p(29e-6), 1) # Maybe as low as 27 us?
         period_pix = max(exposure_pix, rolling_pix) + jitter_pix
 
+        # Calculate scan_range_um and check limit:
+        scan_range_um = calculate_scan_range_um(
+            self.scan_step_size_px, self.slices_per_volume)
+        assert 0 <= scan_range_um <= 200 # optical limit
+
         # Calculate galvo voltages from volume settings:
-        self.voxel_aspect_ratio = self.shear_px_per_scan_step * np.tan(tilt)
-        self.scan_step_size_um = (
-            self.voxel_aspect_ratio * sample_px_um / np.sin(tilt))
-        
-        scan_range_um = self.scan_step_size_um * (self.slices_per_volume - 1)
-        assert 0 <= scan_range_um <= 201 # optical limit
         galvo_volts_per_um = 4.5 / 110 # calibrated using graticule
         galvo_scan_volts = galvo_volts_per_um * scan_range_um
         galvo_voltages = np.linspace(-galvo_scan_volts/2,
@@ -627,28 +641,19 @@ class Snoutscope:
         which_mp_array = shared_numpy_array.buffer
         self.preview_buffer_queue.put(which_mp_array)
 
-
-def legalize_voxel_aspect_ratio(aspect_ratio):
-    return max(int(round(aspect_ratio / np.tan(tilt))), 1) * np.tan(tilt)
-
-def legalize_scan(aspect_ratio, scan_range_um):
-    aspect_ratio = legalize_voxel_aspect_ratio(aspect_ratio)
-    scan_step_size_um = aspect_ratio * sample_px_um / np.sin(tilt)
-    slices_per_vol = 1 + int(round(scan_range_um / scan_step_size_um))
-    scan_range_um = scan_step_size_um * (slices_per_vol - 1)
-    assert 0 <= scan_range_um <= 201 # optical limit
-    return slices_per_vol, scan_step_size_um # watch out for fencepost errors!
-
 class Preprocessor:
     @staticmethod
     def three_traditional_projections_shape(
         scan_steps,
         prop_pxls,
         width_pxls,
-        scan_step_size_um,
+        scan_step_size_px,
         separation_line_px_width=10,
         ):
         # Calculate max pixel shift for shearing on the prop. and scan axes:
+##        TODO: tidy up Preprocesssor, probably removing scan_step_size_um
+##        and re-naming stuff
+        scan_step_size_um = scan_step_size_px * sample_px_um / np.cos(tilt)
         prop_pxls_per_scan_step = scan_step_size_um / (
             sample_px_um * np.cos(tilt))
         prop_px_shift_max = int(np.rint(
@@ -669,7 +674,7 @@ class Preprocessor:
     def three_traditional_projections(
         self,
         data,
-        scan_step_size_um,
+        scan_step_size_px,
         out=None,
         separation_line_px_width=10,
         ):
@@ -678,6 +683,7 @@ class Preprocessor:
         scan_steps, prop_pxls, width_pxls = data.shape
 
         # Calculate max pixel shift for shearing on the prop. and scan axes:
+        scan_step_size_um = scan_step_size_px * sample_px_um / np.cos(tilt)
         prop_pxls_per_scan_step = scan_step_size_um / (
             sample_px_um * np.cos(tilt))
         prop_px_shift_max = int(np.rint(
@@ -750,10 +756,11 @@ class Preprocessor:
         out[:] = np.flipud(out)
         return return_value
 
-    def native_view(self, data, scan_step_size_um):
+    def native_view(self, data, scan_step_size_px):
         # Light-sheet scan, propagation and width axes:
         scan_steps, prop_pxls, width_pxls = data.shape
         
+        scan_step_size_um = scan_step_size_px * sample_px_um / np.cos(tilt)
         prop_axis_step_size_um = scan_step_size_um * np.cos(tilt)
         native_px_shift = prop_axis_step_size_um / sample_px_um # pick integer
         native_px_shift_max = int(np.rint(native_px_shift * (scan_steps - 1)))
@@ -783,15 +790,14 @@ if __name__ == '__main__':
     # 6:ZETquadM
 
     # Scan settings:
-## TODO: figure out how to remove aspect_ratio and deliver slices per volume
-## from scan_range_um
-    aspect_ratio = 8 # 2 about right for Nyquist?
-    shear_px_per_scan_step = 10
-    scan_range_um = 25
-    
+    aspect_ratio = 2
+    scan_range_um = 50
+    scan_step_size_px, slices_per_volume = calculate_cuboid_voxel_scan(
+        aspect_ratio, scan_range_um)
+
     # Camera chip cropping and exposure time:
     crop_pix_lr = 500
-    crop_pix_ud = 500 # max 1019
+    crop_pix_ud = 900 # max 1019
     ill_time_us = 100 # global exposure
 
     # Acquisition:
@@ -800,7 +806,7 @@ if __name__ == '__main__':
     num_snap = 2 # interbuffer time limited by ao play
     delay_s = 0 # insert delay for time series
     t_stamp = "off"
-    max_spiral_tiles = 49
+    max_spiral_tiles = 1
 
     # Calculate bytes_per_buffer for precise memory allocation:
     roi = pco.legalize_roi({'left': 1 + crop_pix_lr,
@@ -810,36 +816,31 @@ if __name__ == '__main__':
                            camera_type='edge 4.2', verbose=False)
     w_px = roi['right'] - roi['left'] + 1
     h_px = roi['bottom'] - roi['top'] + 1
-    slices_per_vol, scan_step_size_um = legalize_scan(
-        aspect_ratio, scan_range_um)
-    
-    legal_aspect_ratio = legalize_voxel_aspect_ratio(aspect_ratio)
-    images_per_buffer = vol_per_buffer * slices_per_vol * len(ch_per_slice)
+
+    images_per_buffer = vol_per_buffer * slices_per_volume * len(ch_per_slice)
     bytes_per_data_buffer = images_per_buffer * h_px * w_px * 2
 
     projection_shape = Preprocessor.three_traditional_projections_shape(
-        slices_per_vol, h_px, w_px, scan_step_size_um)
-    
+        slices_per_volume, h_px, w_px, scan_step_size_px)
+
     bytes_per_preview_buffer = vol_per_buffer * len(ch_per_slice) * int(
         np.prod(projection_shape)) * 2 * max_spiral_tiles
 
     # Create scope object:
     scope = Snoutscope(
         bytes_per_data_buffer, num_data_buffers, bytes_per_preview_buffer)
-    focus_piezo_position_um = (scope.focus_piezo.get_real_position())
-    XY_stage_position_mm = scope.XY_stage.get_position()
-    
+
     scope.apply_settings( # Mandatory call
         roi=roi,
-        shear_px_per_scan_step=shear_px_per_scan_step,
+        scan_step_size_px=scan_step_size_px,
         illumination_time_microseconds=ill_time_us,
         volumes_per_buffer=vol_per_buffer,
-        slices_per_volume=slices_per_vol,
+        slices_per_volume=slices_per_volume,
         channels_per_slice=ch_per_slice,
         power_per_channel=pwr_per_ch,
         filter_wheel_position=fw_pos,
-        focus_piezo_position_um=focus_piezo_position_um,
-        XY_stage_position_mm=XY_stage_position_mm,
+        focus_piezo_position_um=(0,'relative'),
+        XY_stage_position_mm=(0,0,'relative'),
         timestamp_mode=t_stamp,
         ).join()
 
@@ -849,18 +850,18 @@ if __name__ == '__main__':
 ##    scope._plot_voltages()
 
     # Start frames-per-second timer: acquire, display and save
-##    for i in range(num_snap):
-##        start = time.perf_counter()
-##        scope.snoutfocus(filename='snoutfocus_series%i.tif'%i).join()
-##        print('snoutfocus time (s):', (time.perf_counter() - start))
-##        scope.snap(
-##            display=True,
-##            filename='test_images\%06i.tif'%i, # comment out to avoid,
-##            delay_seconds=delay_s
-##            )
-##        t_stamp = "binary+ASCII"
-##        scope.apply_settings(timestamp_mode=t_stamp)
+    for i in range(num_snap):
+        start = time.perf_counter()
+        scope.snoutfocus(filename='snoutfocus_series%i.tif'%i).join()
+        print('snoutfocus time (s):', (time.perf_counter() - start))
+        scope.snap(
+            display=True,
+            filename='test_images\%06i.tif'%i, # comment out to avoid,
+            delay_seconds=delay_s
+            )
+        t_stamp = "binary+ASCII"
+        scope.apply_settings(timestamp_mode=t_stamp)
 
-    scope.spiral_tiling_preview(num_spirals=1, dx_mm=0.01, dy_mm=0.01)
+##    scope.spiral_tiling_preview(num_spirals=1, dx_mm=0.01, dy_mm=0.01)
 
     scope.close()
