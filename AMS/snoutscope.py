@@ -650,10 +650,8 @@ class Preprocessor:
         scan_step_size_px,
         separation_line_px_width=10,
         ):
-        # Calculate max pixel shift for shearing on the prop. and scan axes:
-##        TODO: tidy up Preprocesssor, probably removing scan_step_size_um
-##        and re-naming stuff
-        scan_step_size_um = scan_step_size_px * sample_px_um / np.cos(tilt)
+        # Calculate max pixel shift for shearing on the prop. and scan axes:       
+        scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
         prop_pxls_per_scan_step = scan_step_size_um / (
             sample_px_um * np.cos(tilt))
         prop_px_shift_max = int(np.rint(
@@ -683,7 +681,7 @@ class Preprocessor:
         scan_steps, prop_pxls, width_pxls = data.shape
 
         # Calculate max pixel shift for shearing on the prop. and scan axes:
-        scan_step_size_um = scan_step_size_px * sample_px_um / np.cos(tilt)
+        scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
         prop_pxls_per_scan_step = scan_step_size_um / (
             sample_px_um * np.cos(tilt))
         prop_px_shift_max = int(np.rint(
@@ -760,9 +758,7 @@ class Preprocessor:
         # Light-sheet scan, propagation and width axes:
         scan_steps, prop_pxls, width_pxls = data.shape
         
-        scan_step_size_um = scan_step_size_px * sample_px_um / np.cos(tilt)
-        prop_axis_step_size_um = scan_step_size_um * np.cos(tilt)
-        native_px_shift = prop_axis_step_size_um / sample_px_um # pick integer
+        native_px_shift = scan_step_size_px # pick integer
         native_px_shift_max = int(np.rint(native_px_shift * (scan_steps - 1)))
         native_vol = np.zeros(
             (scan_steps, prop_pxls + native_px_shift_max, width_pxls), 'uint16')
