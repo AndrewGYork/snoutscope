@@ -2,7 +2,6 @@
 import time
 import os
 import atexit
-import threading
 import queue
 
 # Third party imports, installable via pip:
@@ -14,13 +13,26 @@ from tifffile import imread, imwrite
 
 # Our stuff, from github.com/AndrewGYork/tools. Don't pip install.
 # One .py file per module, copy files to your local directory.
-import pco # Install PCO's SDK to get relevant DLLs
-import ni # Install NI-DAQmx to get relevant DLLs
-import sutter
-import physik_instrumente as p_i
-import thorlabs
-import proxy_objects
-from proxied_napari import display
+try: # to allow snoutscope import for 'Pre' and 'Post' processors
+    import pco # Install PCO's SDK to get relevant DLLs
+    import ni # Install NI-DAQmx to get relevant DLLs
+    import sutter
+    import physik_instrumente as p_i
+    import thorlabs
+    import concurrency_tools as ct
+    from napari_in_subprocess import display
+except Exception as e:
+    import traceback
+    error = traceback.format_exc()
+    print('Module import for Snoutscope failed with error:\n', error)
+
+### TODO list: ###
+# - Add automatic save of metadata.txt to relieve GUI/users from this burden
+# - Add a software autofocus option, it may not work for everyone, but will work
+# for most
+# - Expand Postprocessor() methods e.g: .auto_cropper()
+# - Fix the spiral tile preview and find some way off allowing users to pick
+# + move to a field of choice
 
 # Microscope configuration (edit as needed):
 M1 = 200 / 2; Mscan = 70 / 70; M2 = 5 / 357; M3 = 200 / 5
@@ -28,58 +40,65 @@ MRR = M1 * Mscan * M2; Mtot = MRR * M3;
 camera_px_um = 6.5; sample_px_um = camera_px_um / Mtot
 tilt = np.deg2rad(30)
 
-# Snoutscope definitions:
-def calculate_scan_step_size_um(scan_step_size_px):
-    return scan_step_size_px * sample_px_um / np.cos(tilt)
-
-def calculate_scan_range_um(scan_step_size_px, slices_per_volume):
-    scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
-    return scan_step_size_um * (slices_per_volume - 1)
-
-def calculate_voxel_aspect_ratio(scan_step_size_px):
-    return scan_step_size_px * np.tan(tilt)
-
-def calculate_cuboid_voxel_scan(voxel_aspect_ratio, scan_range_um):
-    scan_step_size_px = max(int(round(voxel_aspect_ratio / np.tan(tilt))), 1)
-    scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
-    slices_per_volume = 1 + int(round(scan_range_um / scan_step_size_um))
-    return scan_step_size_px, slices_per_volume # watch out for fencepost!
-
 class Snoutscope:
-    def __init__(
-        self,
-        bytes_per_data_buffer,
-        num_data_buffers,
-        bytes_per_preview_buffer,
-        ):
-        """
-        We use bytes_per_buffer and bytes_per_preview_buffer to specify
-        the shared_memory_sizes for the child processes.
-        """
-        # TODO: Think about an elegant solution for printing and threading
-        self._init_shared_memory(
-            bytes_per_data_buffer, num_data_buffers, bytes_per_preview_buffer)
+    def __init__(self, max_allocated_bytes): # Limit for machine
+        # TODO: Check available system memory?
         self.unfinished_tasks = queue.Queue()
-        slow_fw_init = threading.Thread(target=self._init_filter_wheel) #~5.3s
-        slow_camera_init = threading.Thread(target=self._init_camera) #~3.6s
-        slow_snoutfocus_init = threading.Thread(target=self._init_snoutfocus)#1s
-        slow_focus_init = threading.Thread(target=self._init_focus_piezo) #~0.6s
-        slow_stage_init = threading.Thread(target=self._init_XY_stage) #~0.4s
-        slow_fw_init.start()
-        slow_camera_init.start()
-        slow_snoutfocus_init.start()
-        slow_focus_init.start()
-        slow_stage_init.start()
+        slow_fw_init = ct.ResultThread(
+            target=self._init_filter_wheel).start() #~5.3s
+        slow_camera_init = ct.ResultThread(
+            target=self._init_camera).start() #~3.6s
+        slow_snoutfocus_init = ct.ResultThread(
+            target=self._init_snoutfocus).start()#1s
+        slow_focus_init = ct.ResultThread(
+            target=self._init_focus_piezo).start() #~0.6s
+        slow_stage_init = ct.ResultThread(
+            target=self._init_XY_stage).start() #~0.4s
         self._init_display() #~1.3s
         self._init_preprocessor() #~0.8s
         self._init_ao() #~0.2s
-        slow_stage_init.join()
-        slow_focus_init.join()
-        slow_snoutfocus_init.join()
-        slow_camera_init.join()
-        slow_fw_init.join()
+        slow_stage_init.get_result()
+        slow_focus_init.get_result()
+        slow_snoutfocus_init.get_result()
+        slow_camera_init.get_result()
+        slow_fw_init.get_result()
+        self.max_allocated_bytes = max_allocated_bytes
+        self.max_bytes_per_buffer = (2**31) # Legal tiff
+        self.max_data_buffers = 4 # Camera, preprocessor, display, filesave
+        self.max_preview_buffers = 4 # Camera, preprocessor, display, filesave
+        self.num_active_data_buffers = 0
+        self.num_active_preview_buffers = 0
         print('Finished initializing Snoutscope')
-        # Note: you still have to call .apply_settings() before you can .snap()
+        # Note: you still must call .apply_settings() before you can .acquire()
+
+    def check_memory(
+        self,
+        max_data_buffers,
+        max_preview_buffers,
+        roi,
+        scan_step_size_px,
+        volumes_per_buffer,
+        slices_per_volume,
+        channels_per_slice,
+        ):
+        # Data:
+        ud_px = roi['bottom'] - roi['top'] + 1
+        lr_px = roi['right'] - roi['left'] + 1
+        img = (volumes_per_buffer * slices_per_volume * len(channels_per_slice))
+        bytes_per_data_buffer = 2 * img * ud_px * lr_px
+        assert bytes_per_data_buffer < self.max_bytes_per_buffer
+        # Preview:
+        p_shape = Preprocessor.three_traditional_projections_shape(
+            slices_per_volume, ud_px, lr_px, scan_step_size_px)
+        bytes_per_preview_buffer = (2 * volumes_per_buffer *
+                                    len(channels_per_slice) *
+                                    int(np.prod(p_shape)))
+        assert bytes_per_preview_buffer < self.max_bytes_per_buffer
+        # Total:
+        total_bytes = (bytes_per_data_buffer * max_data_buffers +
+                       bytes_per_preview_buffer * max_preview_buffers)
+        assert total_bytes < self.max_allocated_bytes
+        return None
 
     def apply_settings(
         self,
@@ -94,6 +113,9 @@ class Snoutscope:
         focus_piezo_position_um=None, # Float or (Float, "relative")
         XY_stage_position_mm=None, # (Float, Float, optional: "relative")
         timestamp_mode=None, # String, see pco.py ._set_timestamp_mode()
+        max_bytes_per_buffer=None, # Int
+        max_data_buffers=None, # Int
+        max_preview_buffers=None, # Int
         ):
         ''' Apply any settings to the scope that need to be configured before
             acquring an image. Think filter wheel position, stage position,
@@ -110,6 +132,13 @@ class Snoutscope:
                     setattr(self, k, v) # A lot like self.x = x
                 assert hasattr(self, k), (
                     'Attribute %s must be set by apply_settings()'%k)
+            self.check_memory(self.max_data_buffers,
+                              self.max_preview_buffers,
+                              self.roi,
+                              self.scan_step_size_px,
+                              self.volumes_per_buffer,
+                              self.slices_per_volume,
+                              self.channels_per_slice)
             # Send hardware commands, slowest to fastest:
             if XY_stage_position_mm is not None:
                 x, y = XY_stage_position_mm[0:2]
@@ -152,37 +181,40 @@ class Snoutscope:
                 self.XY_stage.finish_moving()
             self._settings_are_sane = True
             custody.switch_from(self.camera, to=None)
-        settings_thread = proxy_objects.launch_custody_thread(
-            target=settings_task, first_resource=self.camera)
+        settings_thread = ct.CustodyThread(
+            target=settings_task, first_resource=self.camera).start()
         self.unfinished_tasks.put(settings_thread)
         return settings_thread
 
-    def snap(self, display=True, filename=None, delay_seconds=None):
+    def acquire(self, display=True, filename=None, delay_seconds=None):
         if delay_seconds is not None and delay_seconds > 3:
             self.snoutfocus(delay_seconds=delay_seconds) # Might as well!
             delay_seconds = None
-        def snap_task(custody):
+        def acquire_task(custody):
             custody.switch_from(None, to=self.camera)
             if delay_seconds is not None:
                 time.sleep(delay_seconds) # simple but not precise
             assert hasattr(self, '_settings_are_sane'), (
-                'Please call .apply_settings() before using .snap()')
+                'Please call .apply_settings() before using .acquire()')
             assert self._settings_are_sane, (
                 'Did .apply_settings() fail? Please call it again, ' +
                 'with all arguments specified.')
             exposures_per_buffer = (len(self.channels_per_slice) *
                                     self.slices_per_volume *
                                     self.volumes_per_buffer)
+            # Can we aviod writing the same voltages twice?
+            write_voltages_thread = ct.ResultThread(
+                target=self.ao._write_voltages, args=(self.voltages,)).start()
             data_buffer = self._get_data_buffer(
                 (exposures_per_buffer, self.camera.height, self.camera.width),
                 'uint16')
+            write_voltages_thread.get_result()
             # camera.record_to_memory() blocks, so we use a thread:
-            camera_thread = threading.Thread(
+            camera_thread = ct.ResultThread(
                 target=self.camera.record_to_memory,
                 args=(exposures_per_buffer,),
                 kwargs={'out': data_buffer,
-                        'first_trigger_timeout_seconds': 10},)
-            camera_thread.start()
+                        'first_trigger_timeout_seconds': 1},).start()
             # There's a race here. The PCO camera starts with N empty
             # single-frame buffers (typically 16), which are filled by
             # the triggers sent by ao.play_voltages(). The camera_thread
@@ -190,9 +222,9 @@ class Snoutscope:
             # So far, the camera_thread seems to both start on time, and
             # keep up reliably once it starts, but this could be
             # fragile.
-            self.ao.play_voltages(self.voltages, block=False)
+            self.ao.play_voltages(block=False)
             ## TODO: consider finished playing all voltages before moving on...
-            camera_thread.join()
+            camera_thread.get_result()
             # Acquisition is 3D, but display and filesaving are 5D:
             data_buffer = data_buffer.reshape(self.volumes_per_buffer,
                                               self.slices_per_volume,
@@ -226,25 +258,31 @@ class Snoutscope:
                 self.display.show_image(preview_buffer)
                 custody.switch_from(self.display, to=None)
                 if filename is not None:
-                    root, ext = os.path.splitext(filename)
-                    preview_filename = root + '_preview' + ext
-                    print("Saving file", preview_filename, end=' ')
-                    imwrite(preview_filename, preview_buffer, imagej=True)
+                    directory = (os.getcwd() + '\\'
+                                 + os.path.dirname(filename) + '\preview')
+                    if not os.path.exists(directory): os.makedirs(directory)
+                    path = directory + '\\' + os.path.basename(filename)
+                    print("Saving file", path, end=' ')
+                    imwrite(path, preview_buffer, imagej=True)
                     print("done.")
                 self._release_preview_buffer(preview_buffer)
+                del preview_buffer
             else:
                 custody.switch_from(self.camera, to=None)
-            # TODO: if file saving turns out to disrupt other activities
-            # in the main process, make a FileSaving proxy object.
+            # TODO: consider puting FileSaving in a SubProcess
             if filename is not None:
-                print("Saving file", filename, end=' ')
-                imwrite(filename, data_buffer, imagej=True)
+                directory = (os.getcwd() + '\\' +
+                             os.path.dirname(filename) + '\data')
+                if not os.path.exists(directory): os.makedirs(directory)
+                path = directory + '\\' + os.path.basename(filename)
+                print("Saving file", path, end=' ')
+                imwrite(path, data_buffer, imagej=True)
                 print("done.")
             self._release_data_buffer(data_buffer)
-        snap_thread = proxy_objects.launch_custody_thread(
-            target=snap_task, first_resource=self.camera)
-        self.unfinished_tasks.put(snap_thread)
-        return snap_thread
+        acquire_thread = ct.CustodyThread(
+            target=acquire_task, first_resource=self.camera).start()
+        self.unfinished_tasks.put(acquire_thread)
+        return acquire_thread
 
     def snoutfocus(self, filename=None, delay_seconds=None):
         def snoutfocus_task(custody):
@@ -253,6 +291,9 @@ class Snoutscope:
                 start_time = time.perf_counter()
                 if delay_seconds > 3: # 3 seconds is def. enough time to focus
                     time.sleep(delay_seconds - 3)
+            assert self._settings_are_sane, (
+                'Did .apply_settings() fail? Please call it again, ' +
+                'with all arguments specified.')
             self._settings_are_sane = False # In case the thread crashes
             # Record the settings we'll have to reset:
             old_filter_wheel_position = self.filter_wheel_position
@@ -295,14 +336,13 @@ class Snoutscope:
             self.snoutfocus_controller._finish_set_voltage()
             self.filter_wheel._finish_moving()
             # Take pictures while moving the snoutfocus piezo:
-            camera_thread = threading.Thread(
+            camera_thread = ct.ResultThread(
                 target=self.camera.record_to_memory,
                 args=(exposures_per_buffer,),
                 kwargs={'out': data_buffer,
-                        'first_trigger_timeout_seconds': 10},)
-            camera_thread.start()
+                        'first_trigger_timeout_seconds': 1},).start()
             self.ao.play_voltages(voltages, block=False) # Ends at 0 V
-            camera_thread.join()
+            camera_thread.get_result()
             # Start cleaning up after ourselves:
             self.filter_wheel.move(old_filter_wheel_position,
                                    speed=6, block=False)
@@ -333,10 +373,16 @@ class Snoutscope:
                     time.sleep(0.001)
             custody.switch_from(self.camera, to=None)
             if filename is not None:
-                imwrite(filename, data_buffer[:, np.newaxis, :, :])
+                directory = (os.getcwd() + '\\' +
+                             os.path.dirname(filename) + '\snoutfocus')
+                if not os.path.exists(directory): os.makedirs(directory)
+                path = directory + '\\' + os.path.basename(filename)
+                print("Saving file", path, end=' ')
+                imwrite(path, data_buffer[:, np.newaxis, :, :], imagej=True)
+                print("done.")
             self._release_data_buffer(data_buffer)
-        snoutfocus_thread = proxy_objects.launch_custody_thread(
-            target=snoutfocus_task, first_resource=self.camera)
+        snoutfocus_thread = ct.CustodyThread(
+            target=snoutfocus_task, first_resource=self.camera).start()
         self.unfinished_tasks.put(snoutfocus_thread)
         return snoutfocus_thread
 
@@ -357,12 +403,12 @@ class Snoutscope:
         data_filename = "spiral_%02i_%02i.tif"
         preview_filename = "spiral_%02i_%02i_preview.tif"
         ix, iy = [0], [0] # Mutable, integer coords relative to starting tile
-        snap_tasks = []
+        acquire_tasks = []
         def move(x, y):
             ix[0], iy[0] = ix[0]+x, iy[0]+y
             self.apply_settings(
                 XY_stage_position_mm=(dx_mm*x, dy_mm*y, "relative"))
-            snap_tasks.append(self.snap(
+            acquire_tasks.append(self.acquire(
                 filename=data_filename%(ix[0]+num_spirals, iy[0]+num_spirals),
                 display=True))
         def move_up():    move( 0,  1)
@@ -384,12 +430,12 @@ class Snoutscope:
         self.apply_settings( # Return to original position
             XY_stage_position_mm=(-dx_mm*ix[0], -dy_mm*iy[0], "relative"))
         def display_preview_task(custody):
-            # To preserve order we follow the same custody pattern as snap():
+            # To preserve order we follow the same custody pattern as acquire():
             custody.switch_from(None, to=self.camera)
             custody.switch_from(self.camera, to=self.preprocessor)
             custody.switch_from(self.preprocessor, to=self.display)
             # You can't display until the preview files have saved to disk:
-            for st in snap_tasks: st.join()
+            for a in acquire_tasks: a.join()
             # Now you can start to reload the preview images:
             # TODO: re-try (with small delay) if file not found yet?
             first_tile = imread(preview_filename%(0, 0))
@@ -423,7 +469,7 @@ class Snoutscope:
                 th = self.unfinished_tasks.get_nowait()
             except queue.Empty:
                 break
-            th.join()
+            th.get_result()
             collected_tasks.append(th)
         return collected_tasks
 
@@ -438,31 +484,6 @@ class Snoutscope:
         self.XY_stage.close()
         self.display.close()
         print('Closed Snoutscope')
-
-    def _init_shared_memory(
-        self,
-        bytes_per_data_buffer,
-        num_data_buffers,
-        bytes_per_preview_buffer,
-        ):
-        """
-        Each buffer is acquired in deterministic time with a single play
-        of the ao card.
-        """
-        num_preview_buffers = 3 # 3 for preprocess, display and filesave
-        assert bytes_per_data_buffer > 0 and num_data_buffers > 0
-        assert bytes_per_preview_buffer > 0
-        print("Allocating shared memory...", end=' ')
-        self.pm = proxy_objects.ProxyManager(shared_memory_sizes=(
-            (bytes_per_data_buffer,   ) * num_data_buffers +
-            (bytes_per_preview_buffer,) * num_preview_buffers))
-        print("done allocating memory.")
-        self.data_buffer_queue = queue.Queue(maxsize=num_data_buffers)
-        for i in range(num_data_buffers):
-            self.data_buffer_queue.put(i)
-        self.preview_buffer_queue = queue.Queue(maxsize=num_preview_buffers)
-        for i in range(num_preview_buffers):
-            self.preview_buffer_queue.put(i + num_data_buffers) # pointer math!
 
     def _init_ao(self):
         self.names_to_voltage_channels = {
@@ -496,7 +517,7 @@ class Snoutscope:
 
     def _init_camera(self):
         print("Initializing camera... (this sometimes hangs)")
-        self.camera = self.pm.proxy_object(pco.Camera, verbose=False,
+        self.camera = ct.ObjectInSubprocess(pco.Camera, verbose=False,
                                            close_method_name='close')
         self.camera.apply_settings(trigger='external_trigger')
         print("done with camera.")
@@ -522,12 +543,12 @@ class Snoutscope:
 
     def _init_preprocessor(self):
         print("Initializing preprocessor...")
-        self.preprocessor = self.pm.proxy_object(Preprocessor)
+        self.preprocessor = ct.ObjectInSubprocess(Preprocessor)
         print("done with preprocessor.")
 
     def _init_display(self):
         print("Initializing display...")
-        self.display = display(proxy_manager=self.pm)
+        self.display = display()
         print("done with display.")
 
     def _calculate_voltages(self):
@@ -606,40 +627,43 @@ class Snoutscope:
         plt.show()
 
     def _get_data_buffer(self, shape, dtype):
-        which_mp_array = self.data_buffer_queue.get()
-        try:
-            data_buffer = self.pm.shared_numpy_array(
-                which_mp_array, shape, dtype)
-        except ValueError as e:
-            print("Your Snoutscope data buffers are too small to hold a",
-                  shape, "array of type", dtype)
-            print("Either ask for a smaller array, or make a new Snoutscope",
-                  " object with more 'bytes_per_data_buffer'.")
-            raise e
+        while self.num_active_data_buffers >= self.max_data_buffers:
+            time.sleep(1e-3) # 1.7ms min
+        data_buffer = ct.SharedNDArray(shape, dtype)
+        self.num_active_data_buffers += 1
         return data_buffer
 
     def _release_data_buffer(self, shared_numpy_array):
-        assert isinstance(shared_numpy_array, proxy_objects._SharedNumpyArray)
-        which_mp_array = shared_numpy_array.buffer
-        self.data_buffer_queue.put(which_mp_array)
+        assert isinstance(shared_numpy_array, ct.SharedNDArray)
+        self.num_active_data_buffers -= 1
 
     def _get_preview_buffer(self, shape, dtype):
-        which_mp_array = self.preview_buffer_queue.get()
-        try:
-            preview_buffer = self.pm.shared_numpy_array(
-                which_mp_array, shape, dtype)
-        except ValueError as e:
-            print("Your Snoutscope preview buffers are too small to hold a",
-                  shape, "array of type", dtype)
-            print("Either ask for a smaller array, or make a new Snoutscope",
-                  " object with more 'bytes_per_preview_buffer'.")
-            raise e
+        while self.num_active_preview_buffers >= self.max_preview_buffers:
+            time.sleep(1e-3) # 1.7ms min
+        preview_buffer = ct.SharedNDArray(shape, dtype)
+        self.num_active_preview_buffers += 1
         return preview_buffer
 
     def _release_preview_buffer(self, shared_numpy_array):
-        assert isinstance(shared_numpy_array, proxy_objects._SharedNumpyArray)
-        which_mp_array = shared_numpy_array.buffer
-        self.preview_buffer_queue.put(which_mp_array)
+        assert isinstance(shared_numpy_array, ct.SharedNDArray)
+        self.num_active_preview_buffers -= 1
+
+# Snoutscope definitions:
+def calculate_scan_step_size_um(scan_step_size_px):
+    return scan_step_size_px * sample_px_um / np.cos(tilt)
+
+def calculate_scan_range_um(scan_step_size_px, slices_per_volume):
+    scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
+    return scan_step_size_um * (slices_per_volume - 1)
+
+def calculate_voxel_aspect_ratio(scan_step_size_px):
+    return scan_step_size_px * np.tan(tilt)
+
+def calculate_cuboid_voxel_scan(voxel_aspect_ratio, scan_range_um):
+    scan_step_size_px = max(int(round(voxel_aspect_ratio / np.tan(tilt))), 1)
+    scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
+    slices_per_volume = 1 + int(round(scan_range_um / scan_step_size_um))
+    return scan_step_size_px, slices_per_volume # watch out for fencepost!
 
 class Preprocessor:
     @staticmethod
@@ -754,110 +778,72 @@ class Preprocessor:
         out[:] = np.flipud(out)
         return return_value
 
+class Postprocessor:
+    # The native view is the most 'principled' view of the data for analysis
+    # If scan_step_size_px == type(int) then no interpolation is needed to view
+    # the volume. The native view looks at the sample with the 'tilt' of Snouty.
     def native_view(self, data, scan_step_size_px):
         # Light-sheet scan, propagation and width axes:
         scan_steps, prop_pxls, width_pxls = data.shape
-        
-        native_px_shift = scan_step_size_px # pick integer
-        native_px_shift_max = int(np.rint(native_px_shift * (scan_steps - 1)))
-        native_vol = np.zeros(
-            (scan_steps, prop_pxls + native_px_shift_max, width_pxls), 'uint16')
-        
+        scan_step_px_max = int(np.rint(scan_step_size_px * (scan_steps - 1)))
+        native_volume = np.zeros(
+            (scan_steps, prop_pxls + scan_step_px_max, width_pxls), 'uint16')
         for i in range(scan_steps):
-            prop_px_shift = int(np.rint(i * native_px_shift))
-            native_vol[i, prop_px_shift:prop_pxls + prop_px_shift, :
-                       ] = data[i,:,:]
-        orthogonal_axis_step_size_um = scan_step_size_um * np.sin(tilt)
-        Z_pxls = orthogonal_axis_step_size_um / sample_px_um
-        return native_vol, Z_pxls
+            prop_px_shift = int(np.rint(i * scan_step_size_px))
+            native_volume[
+                i, prop_px_shift:prop_pxls + prop_px_shift, :] = data[i,:,:]
+        return native_volume
 
-    def traditional_view(self, native_vol, Z_pxls): # slow but pleasing!
-        native_vol_cubic_voxels = zoom(native_vol,(Z_pxls, 1, 1))
-        traditional_view = rotate(native_vol_cubic_voxels, np.rad2deg(tilt))
-        return traditional_view
+    # Very slow but pleasing - returns the traditional volume!
+    def traditional_view(self, native_volume, voxel_aspect_ratio):
+        native_volume_cubic_voxels = zoom(
+            native_volume, (voxel_aspect_ratio, 1, 1))
+        traditional_volume = rotate(
+            native_volume_cubic_voxels, np.rad2deg(tilt))
+        return traditional_volume
 
 if __name__ == '__main__':
-    # Set variables: tzcyx acquisition
-    # Illumination and emission:
-    ch_per_slice = ("LED", "488") # pick any number and order
-    pwr_per_ch = (50, 10) # set power for each channel
-    fw_pos = 3 # pick 1 filter wheel position per buffer/ao play:
-    # 0:blocked, 1:open, 2:ET450/50M, 3:ET525/50M, 4:ET600/50M, 5:ET690/50M
-    # 6:ZETquadM
-
-    # Scan settings:
+    ### Set variables: tzcyx acquisition ###
+    
+    # Scan: input user frienly options -> return values for .apply_settings()
     aspect_ratio = 2
     scan_range_um = 50
     scan_step_size_px, slices_per_volume = calculate_cuboid_voxel_scan(
         aspect_ratio, scan_range_um)
-
-    # Camera chip cropping and exposure time:
-    crop_pix_lr = 500
-    crop_pix_ud = 900 # max 1019
-    ill_time_us = 100 # global exposure
-
-    # Acquisition:
-    vol_per_buffer = 1
-    num_data_buffers = 3 # increase for multiprocessing
-    num_snap = 2 # interbuffer time limited by ao play
-    delay_s = 0 # insert delay for time series
-    t_stamp = "off"
-    max_spiral_tiles = 1
-
-    # Calculate bytes_per_buffer for precise memory allocation:
-    roi = pco.legalize_roi({'left': 1 + crop_pix_lr,
-                            'right': 2060 - crop_pix_lr,
-                            'top': 1 + crop_pix_ud,
-                            'bottom': 2048 - crop_pix_ud},
-                           camera_type='edge 4.2', verbose=False)
-    w_px = roi['right'] - roi['left'] + 1
-    h_px = roi['bottom'] - roi['top'] + 1
-
-    images_per_buffer = vol_per_buffer * slices_per_volume * len(ch_per_slice)
-    bytes_per_data_buffer = images_per_buffer * h_px * w_px * 2
-
-    projection_shape = Preprocessor.three_traditional_projections_shape(
-        slices_per_volume, h_px, w_px, scan_step_size_px)
-
-    bytes_per_preview_buffer = vol_per_buffer * len(ch_per_slice) * int(
-        np.prod(projection_shape)) * 2 * max_spiral_tiles
+    
+    # Camera chip cropping:
+    crop_px_lr = 500
+    crop_px_ud = 900 # max 1019
+    roi = pco.legalize_roi({'left': 1 + crop_px_lr,
+                            'right': 2060 - crop_px_lr,
+                            'top': 1 + crop_px_ud,
+                            'bottom': 2048 - crop_px_ud},
+                           camera_type='edge 4.2', verbose=False)    
 
     # Create scope object:
-    scope = Snoutscope(
-        bytes_per_data_buffer, num_data_buffers, bytes_per_preview_buffer)
-
+    scope = Snoutscope(100e9) # Max memory bytes for PC
     scope.apply_settings( # Mandatory call
         roi=roi,
         scan_step_size_px=scan_step_size_px,
-        illumination_time_microseconds=ill_time_us,
-        volumes_per_buffer=vol_per_buffer,
+        illumination_time_microseconds=100,
+        volumes_per_buffer=1,
         slices_per_volume=slices_per_volume,
-        channels_per_slice=ch_per_slice,
-        power_per_channel=pwr_per_ch,
-        filter_wheel_position=fw_pos,
+        channels_per_slice=("LED", "488"),
+        power_per_channel=(50, 10),
+        filter_wheel_position=3,
         focus_piezo_position_um=(0,'relative'),
         XY_stage_position_mm=(0,0,'relative'),
-        timestamp_mode=t_stamp,
+        timestamp_mode="off",
         ).join()
 
-    buffer_time = scope.ao.p2s(scope.voltages.shape[0])
-
-    # Optionally, show voltages. Useful for debugging.
-##    scope._plot_voltages()
-
-    # Start frames-per-second timer: acquire, display and save
-    for i in range(num_snap):
-        start = time.perf_counter()
-        scope.snoutfocus(filename='snoutfocus_series%i.tif'%i).join()
-        print('snoutfocus time (s):', (time.perf_counter() - start))
-        scope.snap(
+    # Run snoufocus and acquire:
+    for i in range(2):
+        filename = 'test_images\%06i.tif'%i
+        scope.snoutfocus(filename=filename)
+        scope.acquire(
             display=True,
-            filename='test_images\%06i.tif'%i, # comment out to avoid,
-            delay_seconds=delay_s
+            filename=filename, # comment out to avoid
+            delay_seconds=0
             )
-        t_stamp = "binary+ASCII"
-        scope.apply_settings(timestamp_mode=t_stamp)
-
 ##    scope.spiral_tiling_preview(num_spirals=1, dx_mm=0.01, dy_mm=0.01)
-
     scope.close()
