@@ -1,6 +1,7 @@
 # Imports from the python standard library:
 import time
 import os
+from datetime import datetime
 import atexit
 import queue
 
@@ -34,7 +35,7 @@ except Exception as e:
 # - Fix the spiral tile preview and find some way off allowing users to pick
 # + move to a field of choice
 
-# Microscope configuration (edit as needed):
+# Snoutscope configuration (edit as needed):
 M1 = 200 / 2; Mscan = 70 / 70; M2 = 5 / 357; M3 = 200 / 5
 MRR = M1 * Mscan * M2; Mtot = MRR * M3;
 camera_px_um = 6.5; sample_px_um = camera_px_um / Mtot
@@ -102,17 +103,17 @@ class Snoutscope:
 
     def apply_settings(
         self,
-        roi=None, # Dict, see pco.py ._set_roi()
-        scan_step_size_px=None, # Int (or Float but be careful!)
-        illumination_time_microseconds=None, # Float
-        volumes_per_buffer=None, # Int
-        slices_per_volume=None,  # Int
         channels_per_slice=None, # Tuple of strings
         power_per_channel=None,  # Tuple of floats
         filter_wheel_position=None, # Int
+        illumination_time_microseconds=None, # Float
+        timestamp_mode=None, # String, see pco.py ._set_timestamp_mode()
+        roi=None, # Dict, see pco.py ._set_roi()
+        scan_step_size_px=None, # Int (or Float but be careful!)
+        slices_per_volume=None,  # Int
+        volumes_per_buffer=None, # Int
         focus_piezo_position_um=None, # Float or (Float, "relative")
         XY_stage_position_mm=None, # (Float, Float, optional: "relative")
-        timestamp_mode=None, # String, see pco.py ._set_timestamp_mode()
         max_bytes_per_buffer=None, # Int
         max_data_buffers=None, # Int
         max_preview_buffers=None, # Int
@@ -175,10 +176,13 @@ class Snoutscope:
             # Finalize hardware commands, fastest to slowest:
             if focus_piezo_position_um is not None:
                 self.focus_piezo._finish_moving()
+                self.focus_piezo_position_um = ( # update attribute
+                    self.focus_piezo.get_real_position())
             if filter_wheel_position is not None:
                 self.filter_wheel._finish_moving()
             if XY_stage_position_mm is not None:
                 self.XY_stage.finish_moving()
+                self.XY_stage_position_mm = self.XY_stage.get_position()
             self._settings_are_sane = True
             custody.switch_from(self.camera, to=None)
         settings_thread = ct.CustodyThread(
@@ -277,12 +281,45 @@ class Snoutscope:
                 path = directory + '\\' + os.path.basename(filename)
                 print("Saving file", path, end=' ')
                 imwrite(path, data_buffer, imagej=True)
+                self._save_metadata(filename, delay_seconds, path)
                 print("done.")
             self._release_data_buffer(data_buffer)
         acquire_thread = ct.CustodyThread(
             target=acquire_task, first_resource=self.camera).start()
         self.unfinished_tasks.put(acquire_thread)
         return acquire_thread
+
+    def _save_metadata(self, filename, delay_seconds, path):
+        to_save = {
+            'Date':datetime.strftime(datetime.now(),'%Y-%m-%d'),
+            'Time':datetime.strftime(datetime.now(),'%H:%M:%S'),
+            'filename':filename,
+            'delay_seconds':delay_seconds,
+            'channels_per_slice':self.channels_per_slice,
+            'power_per_channel':self.power_per_channel,
+            'filter_wheel_position':self.filter_wheel_position,
+            'illumination_time_us':self.illumination_time_microseconds,
+            'timestamp_mode':self.timestamp_mode,
+            'roi':self.roi,
+            'scan_step_size_px':self.scan_step_size_px,
+            'scan_step_size_um':calculate_scan_step_size_um(
+                self.scan_step_size_px),
+            'slices_per_volume':self.slices_per_volume,
+            'scan_range_um':calculate_scan_range_um(
+                self.scan_step_size_px, self.slices_per_volume),
+            'volumes_per_buffer':self.volumes_per_buffer,
+            'focus_piezo_position_um':self.focus_piezo_position_um,
+            'XY_stage_position_mm':self.XY_stage_position_mm,
+            'MRR':MRR,
+            'Mtot':Mtot,
+            'tilt':tilt,
+            'sample_px_um':sample_px_um,
+            'voxel_aspect_ratio':calculate_voxel_aspect_ratio(
+                self.scan_step_size_px),
+            }
+        with open(os.path.splitext(path)[0] + '_metadata.txt', 'w') as file:
+            for k, v in to_save.items():
+                file.write(k + ': ' + str(v) + '\n')
 
     def snoutfocus(self, filename=None, delay_seconds=None):
         def snoutfocus_task(custody):
@@ -823,17 +860,17 @@ if __name__ == '__main__':
     # Create scope object:
     scope = Snoutscope(100e9) # Max memory bytes for PC
     scope.apply_settings( # Mandatory call
-        roi=roi,
-        scan_step_size_px=scan_step_size_px,
-        illumination_time_microseconds=100,
-        volumes_per_buffer=1,
-        slices_per_volume=slices_per_volume,
         channels_per_slice=("LED", "488"),
         power_per_channel=(50, 10),
         filter_wheel_position=3,
+        illumination_time_microseconds=100,
+        timestamp_mode="off",
+        roi=roi,
+        scan_step_size_px=scan_step_size_px,
+        slices_per_volume=slices_per_volume,
+        volumes_per_buffer=1,
         focus_piezo_position_um=(0,'relative'),
         XY_stage_position_mm=(0,0,'relative'),
-        timestamp_mode="off",
         ).join()
 
     # Run snoufocus and acquire:
