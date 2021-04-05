@@ -66,6 +66,7 @@ class Snoutscope:
         self.max_bytes_per_buffer = (2**31) # Legal tiff
         self.max_data_buffers = 4 # Camera, preprocessor, display, filesave
         self.max_preview_buffers = 4 # Camera, preprocessor, display, filesave
+        self.preview_line_px_width = 10 # line thickness for previews
         self.num_active_data_buffers = 0
         self.num_active_preview_buffers = 0
         print('Finished initializing Snoutscope')
@@ -73,13 +74,14 @@ class Snoutscope:
 
     def check_memory(
         self,
-        max_data_buffers,
-        max_preview_buffers,
+        channels_per_slice,
         roi,
         scan_step_size_px,
-        volumes_per_buffer,
         slices_per_volume,
-        channels_per_slice,
+        volumes_per_buffer,
+        max_data_buffers,
+        max_preview_buffers,
+        preview_line_px_width,
         ):
         # Data:
         ud_px = roi['bottom'] - roi['top'] + 1
@@ -89,7 +91,11 @@ class Snoutscope:
         assert bytes_per_data_buffer < self.max_bytes_per_buffer
         # Preview:
         p_shape = Preprocessor.three_traditional_projections_shape(
-            slices_per_volume, ud_px, lr_px, scan_step_size_px)
+            slices_per_volume,
+            ud_px,
+            lr_px,
+            scan_step_size_px,
+            preview_line_px_width)
         bytes_per_preview_buffer = (2 * volumes_per_buffer *
                                     len(channels_per_slice) *
                                     int(np.prod(p_shape)))
@@ -116,6 +122,7 @@ class Snoutscope:
         max_bytes_per_buffer=None, # Int
         max_data_buffers=None, # Int
         max_preview_buffers=None, # Int
+        preview_line_px_width=None, # Int
         ):
         ''' Apply any settings to the scope that need to be configured before
             acquring an image. Think filter wheel position, stage position,
@@ -132,13 +139,14 @@ class Snoutscope:
                     setattr(self, k, v) # A lot like self.x = x
                 assert hasattr(self, k), (
                     'Attribute %s must be set by apply_settings()'%k)
-            self.check_memory(self.max_data_buffers,
-                              self.max_preview_buffers,
+            self.check_memory(self.channels_per_slice,
                               self.roi,
                               self.scan_step_size_px,
-                              self.volumes_per_buffer,
                               self.slices_per_volume,
-                              self.channels_per_slice)
+                              self.volumes_per_buffer,
+                              self.max_data_buffers,
+                              self.max_preview_buffers,
+                              self.preview_line_px_width)
             # Send hardware commands, slowest to fastest:
             if XY_stage_position_mm is not None:
                 x, y = XY_stage_position_mm[0:2]
@@ -254,10 +262,12 @@ class Snoutscope:
                                               len(self.channels_per_slice),
                                               data_buffer.shape[-2],
                                               data_buffer.shape[-1])
-            data_path, preview_path = prepare_to_save_thread.get_result()
+            if filename is not None:
+                data_path, preview_path = prepare_to_save_thread.get_result()
             if display:
                 # We have custody of the camera so attribute access is safe:
                 scan_step_size_px = self.scan_step_size_px
+                preview_line_px_width = self.preview_line_px_width
                 skip_rows = 0
                 if self.timestamp_mode != "off":
                     skip_rows = 8 # Ignore rows so timestamps don't dominate
@@ -269,7 +279,8 @@ class Snoutscope:
                         self.slices_per_volume,
                         preview_me.shape[-2],
                         preview_me.shape[-1],
-                        scan_step_size_px))
+                        scan_step_size_px,
+                        preview_line_px_width))
                 custody.switch_from(self.camera, to=self.preprocessor)
                 preview_buffer = self._get_preview_buffer(prev_shape, 'uint16')
                 for vo in range(preview_me.shape[0]):
@@ -277,6 +288,7 @@ class Snoutscope:
                         self.preprocessor.three_traditional_projections(
                             data_buffer[vo, :, ch, skip_rows:, :],
                             scan_step_size_px,
+                            preview_line_px_width,
                             out=preview_buffer[vo, ch, :, :])
                 custody.switch_from(self.preprocessor, to=self.display)
                 self.display.show_image(preview_buffer)
@@ -319,6 +331,7 @@ class Snoutscope:
             'volumes_per_buffer':self.volumes_per_buffer,
             'focus_piezo_position_um':self.focus_piezo_position_um,
             'XY_stage_position_mm':self.XY_stage_position_mm,
+            'preview_line_px_width':self.preview_line_px_width,
             'MRR':MRR,
             'Mtot':Mtot,
             'tilt':tilt,
@@ -717,7 +730,7 @@ class Preprocessor:
         prop_pxls,
         width_pxls,
         scan_step_size_px,
-        separation_line_px_width=10,
+        preview_line_px_width,
         ):
         # Calculate max pixel shift for shearing on the prop. and scan axes:       
         scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
@@ -734,7 +747,7 @@ class Preprocessor:
         y_pxls = int(round(
             (prop_pxls + prop_px_shift_max) * np.cos(tilt)))
         z_pxls = int(round(prop_pxls * np.sin(tilt)))
-        ln_pxls = separation_line_px_width
+        ln_pxls = preview_line_px_width
         shape = (y_pxls + z_pxls + 2*ln_pxls, x_pxls + z_pxls + 2*ln_pxls)
         return shape
         
@@ -742,8 +755,8 @@ class Preprocessor:
         self,
         data,
         scan_step_size_px,
+        preview_line_px_width,
         out=None,
-        separation_line_px_width=10,
         ):
         # TODO: consider allowing -ve scan for bi-directional scanning
         # Light-sheet scan, propagation and width axes:
@@ -792,7 +805,7 @@ class Preprocessor:
 
         # Make image with all projections and flip for traditional view:
         y_pxls, x_pxls = O1_img.shape
-        ln_px = separation_line_px_width # to keep lines of code short!
+        ln_px = preview_line_px_width # to keep lines of code short!
         ln_min, ln_max = O1_img.min(), O1_img.max()
 
         if out is None:
@@ -846,8 +859,6 @@ class Postprocessor:
         traditional_volume = rotate(
             native_volume_cubic_voxels, np.rad2deg(tilt))
         return traditional_volume
-
-    
 
 if __name__ == '__main__':
     ### Set variables: tzcyx acquisition ###
