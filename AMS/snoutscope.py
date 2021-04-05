@@ -28,7 +28,6 @@ except Exception as e:
     print('Module import for Snoutscope failed with error:\n', error)
 
 ### TODO list: ###
-# - Add automatic save of metadata.txt to relieve GUI/users from this burden
 # - Add a software autofocus option, it may not work for everyone, but will work
 # for most
 # - Expand Postprocessor() methods e.g: .auto_cropper()
@@ -195,6 +194,22 @@ class Snoutscope:
             self.snoutfocus(delay_seconds=delay_seconds) # Might as well!
             delay_seconds = None
         def acquire_task(custody):
+            def prepare_to_save_task(filename, delay_seconds):
+                cwd = os.getcwd()
+                folder, name = os.path.split(filename)
+                data_directory = cwd + '\\' + folder + '\data'
+                if not os.path.exists(data_directory):
+                    os.makedirs(data_directory)
+                data_path = data_directory + '\\' + name
+                self._save_metadata(filename, delay_seconds, data_path)
+                if display:
+                    preview_directory = (cwd + '\\' + folder + '\preview')
+                    if not os.path.exists(preview_directory):
+                        os.makedirs(preview_directory)
+                    preview_path = preview_directory + '\\' + name
+                else:
+                    preview_path = None
+                return data_path, preview_path
             custody.switch_from(None, to=self.camera)
             if delay_seconds is not None:
                 time.sleep(delay_seconds) # simple but not precise
@@ -203,6 +218,10 @@ class Snoutscope:
             assert self._settings_are_sane, (
                 'Did .apply_settings() fail? Please call it again, ' +
                 'with all arguments specified.')
+            if filename is not None:
+                prepare_to_save_thread = ct.ResultThread(
+                    target=prepare_to_save_task,
+                    args=(filename, delay_seconds)).start()
             exposures_per_buffer = (len(self.channels_per_slice) *
                                     self.slices_per_volume *
                                     self.volumes_per_buffer)
@@ -235,6 +254,7 @@ class Snoutscope:
                                               len(self.channels_per_slice),
                                               data_buffer.shape[-2],
                                               data_buffer.shape[-1])
+            data_path, preview_path = prepare_to_save_thread.get_result()
             if display:
                 # We have custody of the camera so attribute access is safe:
                 scan_step_size_px = self.scan_step_size_px
@@ -262,27 +282,16 @@ class Snoutscope:
                 self.display.show_image(preview_buffer)
                 custody.switch_from(self.display, to=None)
                 if filename is not None:
-                    directory = (os.getcwd() + '\\'
-                                 + os.path.dirname(filename) + '\preview')
-                    if not os.path.exists(directory): os.makedirs(directory)
-                    path = directory + '\\' + os.path.basename(filename)
-                    print("Saving file", path, end=' ')
-                    imwrite(path, preview_buffer, imagej=True)
-                    print("done.")
+                    print("Saving file:", preview_path)
+                    imwrite(preview_path, preview_buffer, imagej=True)
                 self._release_preview_buffer(preview_buffer)
                 del preview_buffer
             else:
                 custody.switch_from(self.camera, to=None)
             # TODO: consider puting FileSaving in a SubProcess
             if filename is not None:
-                directory = (os.getcwd() + '\\' +
-                             os.path.dirname(filename) + '\data')
-                if not os.path.exists(directory): os.makedirs(directory)
-                path = directory + '\\' + os.path.basename(filename)
-                print("Saving file", path, end=' ')
-                imwrite(path, data_buffer, imagej=True)
-                self._save_metadata(filename, delay_seconds, path)
-                print("done.")
+                print("Saving file:", data_path)
+                imwrite(data_path, data_buffer, imagej=True)
             self._release_data_buffer(data_buffer)
         acquire_thread = ct.CustodyThread(
             target=acquire_task, first_resource=self.camera).start()
@@ -414,9 +423,8 @@ class Snoutscope:
                              os.path.dirname(filename) + '\snoutfocus')
                 if not os.path.exists(directory): os.makedirs(directory)
                 path = directory + '\\' + os.path.basename(filename)
-                print("Saving file", path, end=' ')
+                print("Saving file:", path)
                 imwrite(path, data_buffer[:, np.newaxis, :, :], imagej=True)
-                print("done.")
             self._release_data_buffer(data_buffer)
         snoutfocus_thread = ct.CustodyThread(
             target=snoutfocus_task, first_resource=self.camera).start()
@@ -839,10 +847,18 @@ class Postprocessor:
             native_volume_cubic_voxels, np.rad2deg(tilt))
         return traditional_volume
 
+    
+
 if __name__ == '__main__':
     ### Set variables: tzcyx acquisition ###
+    ## Options ##
+    # channels_per_slice = ('LED','405','488','561','640') # any number/order
+    # power_per_channel =  (5,0,20,30,100) # 0-100% match to channels
+    # filter_wheel_position = 0 # pick 1 position per buffer/ao play:
+    # 0:blocked, 1:open, 2:ET450/50M, 3:ET525/50M, 4:ET600/50M, 5:ET690/50M
+    # 6:ZETquadM
     
-    # Scan: input user frienly options -> return values for .apply_settings()
+    # Scan: input user friendly options -> return values for .apply_settings()
     aspect_ratio = 2
     scan_range_um = 50
     scan_step_size_px, slices_per_volume = calculate_cuboid_voxel_scan(
