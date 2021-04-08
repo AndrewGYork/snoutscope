@@ -837,6 +837,35 @@ class Preprocessor:
         return return_value
 
 class Postprocessor:
+    # This method can be used for software autofocus. It uses an earlier
+    # 'preview' image to estimate the z location of the sample. Choose:
+    # - 'max_intensity' to track the brightest z pixel
+    # - 'max_gradient' as a proxy for the coverslip boundary z pixel
+    def estimate_sample_z_axis_px(
+        self,
+        preview_image, # single volume, single channel
+        roi,
+        timestamp_mode,
+        preview_line_px_width,
+        method='max_gradient',
+        ):
+        assert method in ('max_intensity', 'max_gradient')
+        w_px = roi['right'] - roi['left'] + 1
+        h_px = roi['bottom'] - roi['top'] + 1
+        if timestamp_mode != "off": h_px = h_px - 8 # skip timestamp rows
+        z_px = int(round(h_px * np.sin(tilt))) # Preprocessor definition
+        inspect_me = preview_image[:z_px, preview_line_px_width:w_px]
+        intensity_line = np.average(inspect_me, axis=1)[::-1] # O1 -> coverslip
+        if method == 'max_intensity':
+            return np.argmax(intensity_line)
+        max_intensity = np.max(intensity_line)
+        intensity_gradient = np.zeros((len(intensity_line) - 1))
+        for px in range(len(intensity_line) - 1):
+            intensity_gradient[px] = intensity_line[px + 1] - intensity_line[px]
+            if intensity_line[px + 1] == max_intensity:
+                break
+        return np.argmax(intensity_gradient)
+    
     # The native view is the most 'principled' view of the data for analysis
     # If scan_step_size_px == type(int) then no interpolation is needed to view
     # the volume. The native view looks at the sample with the 'tilt' of Snouty.
@@ -862,13 +891,10 @@ class Postprocessor:
 
 if __name__ == '__main__':
     ### Set variables: tzcyx acquisition ###
-    ## Options ##
-    # channels_per_slice = ('LED','405','488','561','640') # any number/order
-    # power_per_channel =  (5,0,20,30,100) # 0-100% match to channels
-    # filter_wheel_position = 0 # pick 1 position per buffer/ao play:
-    # 0:blocked, 1:open, 2:ET450/50M, 3:ET525/50M, 4:ET600/50M, 5:ET690/50M
-    # 6:ZETquadM
-    
+    ## filter wheel options:        0:blocked,      1:open
+    # 2:ET450/50M,  3:ET525/50M,    4:ET600/50M,    5:ET690/50M
+    # 6:ZETquadM,   7:empty         8:empty         9:empty
+
     # Scan: input user friendly options -> return values for .apply_settings()
     aspect_ratio = 2
     scan_range_um = 50
@@ -887,11 +913,11 @@ if __name__ == '__main__':
     # Create scope object:
     scope = Snoutscope(100e9) # Max memory bytes for PC
     scope.apply_settings( # Mandatory call
-        channels_per_slice=("LED", "488"),
-        power_per_channel=(50, 10),
-        filter_wheel_position=3,
+        channels_per_slice=("LED", "488"), # ('LED','405','488','561','640')
+        power_per_channel=(50, 10), # (5,0,20,30,100) # 0-100% match to channels
+        filter_wheel_position=3, # pick 1 position - see above options
         illumination_time_microseconds=100,
-        timestamp_mode="off",
+        timestamp_mode="off", # pick: "off", "binary", "binary+ASCII", "ASCII"
         roi=roi,
         scan_step_size_px=scan_step_size_px,
         slices_per_volume=slices_per_volume,
@@ -901,12 +927,11 @@ if __name__ == '__main__':
         ).join()
 
     # Run snoufocus and acquire:
+    scope.snoutfocus()
     for i in range(2):
-        filename = 'test_images\%06i.tif'%i
-        scope.snoutfocus(filename=filename)
         scope.acquire(
             display=True,
-            filename=filename, # comment out to avoid
+            filename='test_images\%06i.tif'%i, # comment out to avoid
             delay_seconds=0
             )
 ##    scope.spiral_tiling_preview(num_spirals=1, dx_mm=0.01, dy_mm=0.01)
