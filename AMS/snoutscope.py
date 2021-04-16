@@ -7,7 +7,7 @@ import queue
 
 # Third party imports, installable via pip:
 import numpy as np
-from scipy.ndimage import zoom, rotate
+from scipy.ndimage import zoom, rotate, gaussian_filter1d
 from tifffile import imread, imwrite
 # import matplotlib
 # We only import matplotlib if/when we call Snoutscope._plot_voltages()
@@ -753,14 +753,14 @@ class Preprocessor:
         
     def three_traditional_projections(
         self,
-        data,
+        volume, # raw data 3D: single volume, single channel
         scan_step_size_px,
         preview_line_px_width,
         out=None,
         ):
         # TODO: consider allowing -ve scan for bi-directional scanning
         # Light-sheet scan, propagation and width axes:
-        scan_steps, prop_pxls, width_pxls = data.shape
+        scan_steps, prop_pxls, width_pxls = volume.shape
 
         # Calculate max pixel shift for shearing on the prop. and scan axes:
         scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
@@ -781,9 +781,9 @@ class Preprocessor:
         for i in range(scan_steps):
             prop_px_shift = int(np.rint(i * prop_pxls_per_scan_step))
             target = O1_proj[prop_px_shift:prop_pxls + prop_px_shift, :]
-            np.maximum(target, data[i, :, :], out=target) # O1 
-            np.maximum(scan_proj, data[i, :, :], out=scan_proj) # scan 
-            np.amax(data[i, :, :], axis=1, out=width_proj[i, :]) # width
+            np.maximum(target, volume[i, :, :], out=target) # O1 
+            np.maximum(scan_proj, volume[i, :, :], out=scan_proj) # scan 
+            np.amax(volume[i, :, :], axis=1, out=width_proj[i, :]) # width
 
         # Unshear the width projection:
         unsheared_width_proj = np.zeros(
@@ -843,11 +843,12 @@ class Postprocessor:
     # - 'max_gradient' as a proxy for the coverslip boundary z pixel
     def estimate_sample_z_axis_px(
         self,
-        preview_image, # single volume, single channel
+        preview_image, # 2D preview: single volume, single channel
         roi,
         timestamp_mode,
         preview_line_px_width,
         method='max_gradient',
+        gaussian_filter_std=3,
         ):
         assert method in ('max_intensity', 'max_gradient')
         w_px = roi['right'] - roi['left'] + 1
@@ -856,33 +857,98 @@ class Postprocessor:
         z_px = int(round(h_px * np.sin(tilt))) # Preprocessor definition
         inspect_me = preview_image[:z_px, preview_line_px_width:w_px]
         intensity_line = np.average(inspect_me, axis=1)[::-1] # O1 -> coverslip
+        intensity_line_smooth = gaussian_filter1d(
+            intensity_line, gaussian_filter_std) # reject hot pixels 
         if method == 'max_intensity':
-            return np.argmax(intensity_line)
-        max_intensity = np.max(intensity_line)
-        intensity_gradient = np.zeros((len(intensity_line) - 1))
-        for px in range(len(intensity_line) - 1):
-            intensity_gradient[px] = intensity_line[px + 1] - intensity_line[px]
-            if intensity_line[px + 1] == max_intensity:
+            return np.argmax(intensity_line_smooth)
+        max_intensity = np.max(intensity_line_smooth)
+        intensity_gradient = np.zeros((len(intensity_line_smooth) - 1))
+        for px in range(len(intensity_line_smooth) - 1):
+            intensity_gradient[px] = (
+                intensity_line_smooth[px + 1] - intensity_line_smooth[px])
+            if intensity_line_smooth[px + 1] == max_intensity:
                 break
         return np.argmax(intensity_gradient)
-    
+
+    # This method can be used for cropping empty pixels from raw data.
+    # The snoutscope produces vast amounts of data very quickly, often with
+    # many empty pixels - discarding them can help manage the deluge.
+    def estimate_roi(
+        self,
+        volume, # raw data 3D: single volume, single channel
+        timestamp_mode,
+        signal_to_bg_ratio=1.2, # adjust for threshold
+        gaussian_filter_std=3, # adjust for smoothing/hot pixel rejection
+        ):
+        scan_px, prop_px, width_px = volume.shape
+        ts_px = 0
+        if timestamp_mode != "off": ts_px = 8 # skip timestamp rows
+        # Max project volume to images:
+        width_projection = np.amax(volume[:,ts_px:,:], axis=2)
+        scan_projection  = np.amax(volume[:,ts_px:,:], axis=0)
+        # Max project images to lines and smooth to reject hot pixels:
+        scan_line  = gaussian_filter1d(
+            np.max(width_projection, axis=1), gaussian_filter_std)
+        prop_line  = gaussian_filter1d(
+            np.max(scan_projection, axis=1), gaussian_filter_std)
+        width_line = gaussian_filter1d(
+            np.max(scan_projection, axis=0), gaussian_filter_std)
+        # Find background level and set threshold:
+        scan_threshold  = int(min(scan_line)  * signal_to_bg_ratio)
+        prop_threshold  = int(min(prop_line)  * signal_to_bg_ratio)
+        width_threshold = int(min(width_line) * signal_to_bg_ratio)
+        # Estimate roi:
+        i_min, i_max = [0, 0, 0], [scan_px - 1, prop_px - 1, width_px - 1]
+        for i in range(scan_px):
+            if scan_line[i]  > scan_threshold:
+                i_min[0] = i
+                break
+        for i in range(prop_px):
+            if prop_line[i]  > prop_threshold:
+                i_min[1] = i + ts_px # put timestamp rows back
+                break
+        for i in range(width_px):
+            if width_line[i] > width_threshold:
+                i_min[2] = i
+                break        
+        for i in range(scan_px):
+            if scan_line[-i] > scan_threshold:
+                i_max[0] = i_max[0] - i
+                break
+        for i in range(prop_px):
+            if prop_line[-i] > prop_threshold:
+                i_max[1] = i_max[1] - i - ts_px # put timestamp rows back
+                break
+        for i in range(width_px):
+            if width_line[-i] > width_threshold:
+                i_max[2] = i_max[2] - i
+                break
+        return i_min, i_max
+
     # The native view is the most 'principled' view of the data for analysis
     # If scan_step_size_px == type(int) then no interpolation is needed to view
     # the volume. The native view looks at the sample with the 'tilt' of Snouty.
-    def native_view(self, data, scan_step_size_px):
+    def native_view(
+        self,
+        volume, # raw data 3D: single volume, single channel
+        scan_step_size_px): 
         # Light-sheet scan, propagation and width axes:
-        scan_steps, prop_pxls, width_pxls = data.shape
+        scan_steps, prop_pxls, width_pxls = volume.shape
         scan_step_px_max = int(np.rint(scan_step_size_px * (scan_steps - 1)))
         native_volume = np.zeros(
             (scan_steps, prop_pxls + scan_step_px_max, width_pxls), 'uint16')
         for i in range(scan_steps):
             prop_px_shift = int(np.rint(i * scan_step_size_px))
             native_volume[
-                i, prop_px_shift:prop_pxls + prop_px_shift, :] = data[i,:,:]
+                i, prop_px_shift:prop_pxls + prop_px_shift, :] = volume[i,:,:]
         return native_volume
 
     # Very slow but pleasing - returns the traditional volume!
-    def traditional_view(self, native_volume, voxel_aspect_ratio):
+    def traditional_view(
+        self,
+        native_volume, # native volume 3D: single volume, single channel
+        scan_step_size_px):
+        voxel_aspect_ratio = calculate_voxel_aspect_ratio(scan_step_size_px)
         native_volume_cubic_voxels = zoom(
             native_volume, (voxel_aspect_ratio, 1, 1))
         traditional_volume = rotate(
