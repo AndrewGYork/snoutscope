@@ -27,14 +27,7 @@ except Exception as e:
     error = traceback.format_exc()
     print('Module import for Snoutscope failed with error:\n', error)
 
-### TODO list: ###
-# - Add a software autofocus option, it may not work for everyone, but will work
-# for most
-# - Expand Postprocessor() methods e.g: .auto_cropper()
-# - Fix the spiral tile preview and find some way off allowing users to pick
-# + move to a field of choice
-
-# Snoutscope configuration (edit as needed):
+# Snoutscope optical configuration (edit as needed):
 M1 = 200 / 2; Mscan = 70 / 70; M2 = 5 / 357; M3 = 200 / 5
 MRR = M1 * Mscan * M2; Mtot = MRR * M3;
 camera_px_um = 6.5; sample_px_um = camera_px_um / Mtot
@@ -125,13 +118,11 @@ class Snoutscope:
         preview_line_px_width=None, # Int
         ):
         ''' Apply any settings to the scope that need to be configured before
-            acquring an image. Think filter wheel position, stage position,
-            camera settings, light intensity, calculate daq voltages, etc.'''
+            acquiring data - see list of arguments for options.'''
         args = locals()
         args.pop('self')
         def settings_task(custody):
-            custody.switch_from(None, to=self.camera)
-            # We own the camera, safe to change settings
+            custody.switch_from(None, to=self.camera) # Safe to change settings
             self._settings_are_sane = False # In case the thread crashes
             # Attributes must be set previously or currently:
             for k, v in args.items(): 
@@ -191,7 +182,7 @@ class Snoutscope:
                 self.XY_stage.finish_moving()
                 self.XY_stage_position_mm = self.XY_stage.get_position()
             self._settings_are_sane = True
-            custody.switch_from(self.camera, to=None)
+            custody.switch_from(self.camera, to=None) # Release camera
         settings_thread = ct.CustodyThread(
             target=settings_task, first_resource=self.camera).start()
         self.unfinished_tasks.put(settings_thread)
@@ -218,7 +209,7 @@ class Snoutscope:
                 else:
                     preview_path = None
                 return data_path, preview_path
-            custody.switch_from(None, to=self.camera)
+            custody.switch_from(None, to=self.camera) # Get camera
             if delay_seconds is not None:
                 time.sleep(delay_seconds) # simple but not precise
             assert hasattr(self, '_settings_are_sane'), (
@@ -252,7 +243,10 @@ class Snoutscope:
             # empties them, hopefully fast enough that we never run out.
             # So far, the camera_thread seems to both start on time, and
             # keep up reliably once it starts, but this could be
-            # fragile.
+            # fragile. The camera thread (effectively) acquires shared memory
+            # as it writes to the allocated buffer. On this machine the memory
+            # acquisition is faster than the camera (~4GB/s vs ~1GB/s) but this
+            # could also be fragile if another process interferes.
             self.ao.play_voltages(block=False)
             ## TODO: consider finished playing all voltages before moving on...
             camera_thread.get_result()
@@ -345,7 +339,7 @@ class Snoutscope:
 
     def snoutfocus(self, filename=None, delay_seconds=None):
         def snoutfocus_task(custody):
-            custody.switch_from(None, to=self.camera) # safe to change settings
+            custody.switch_from(None, to=self.camera) # Safe to change settings
             if delay_seconds is not None:
                 start_time = time.perf_counter()
                 if delay_seconds > 3: # 3 seconds is def. enough time to focus
@@ -455,7 +449,8 @@ class Snoutscope:
         ####################
         # TODO: xy, or yx? What's stage leftright vs. screen leftright?
         # If we get this straight, this code will suck less.
-## TODO: - make sure stage is at max velocity and then return
+## TODO: - make sure stage is at max velocity and then return to previous
+##       - Find some way off allowing users to pick + move to a field of choice
         assert dx_mm and dy_mm < 1
         assert num_spirals < 4 # C'mon don't be silly, this is still a lot
         data_filename = "spiral_%02i_%02i.tif"
@@ -625,26 +620,21 @@ class Snoutscope:
         assert self.slices_per_volume > 0
         assert self.volumes_per_buffer == int(self.volumes_per_buffer)
         assert self.volumes_per_buffer > 0
-
         # Timing information
         exposure_pix = self.ao.s2p(1e-6*self.camera.exposure_time_microseconds)
         rolling_pix = self.ao.s2p(1e-6*self.camera.rolling_time_microseconds)
-
         jitter_pix = max(self.ao.s2p(29e-6), 1) # Maybe as low as 27 us?
         period_pix = max(exposure_pix, rolling_pix) + jitter_pix
-
         # Calculate scan_range_um and check limit:
         scan_range_um = calculate_scan_range_um(
             self.scan_step_size_px, self.slices_per_volume)
         assert 0 <= scan_range_um <= 200 # optical limit
-
         # Calculate galvo voltages from volume settings:
         galvo_volts_per_um = 4.5 / 110 # calibrated using graticule
         galvo_scan_volts = galvo_volts_per_um * scan_range_um
         galvo_voltages = np.linspace(-galvo_scan_volts/2,
                                      galvo_scan_volts/2,
                                      self.slices_per_volume)
-
         # Calculate voltages
         voltages = []
         for vo in range(self.volumes_per_buffer):
@@ -687,6 +677,8 @@ class Snoutscope:
     def _get_data_buffer(self, shape, dtype):
         while self.num_active_data_buffers >= self.max_data_buffers:
             time.sleep(1e-3) # 1.7ms min
+        # Note: this does not actually allocate the memory. Allocation happens
+        # during the first 'write' process inside camera.record_to_memory
         data_buffer = ct.SharedNDArray(shape, dtype)
         self.num_active_data_buffers += 1
         return data_buffer
@@ -698,6 +690,8 @@ class Snoutscope:
     def _get_preview_buffer(self, shape, dtype):
         while self.num_active_preview_buffers >= self.max_preview_buffers:
             time.sleep(1e-3) # 1.7ms min
+        # Note: this does not actually allocate the memory. Allocation happens
+        # during the first 'write' process inside camera.record_to_memory
         preview_buffer = ct.SharedNDArray(shape, dtype)
         self.num_active_preview_buffers += 1
         return preview_buffer
@@ -741,7 +735,6 @@ class Preprocessor:
         scan_steps_per_prop_px = 1 / prop_pxls_per_scan_step
         scan_px_shift_max = int(np.rint(
             scan_steps_per_prop_px * (prop_pxls - 1)))
-
         # Make image with all projections and flip for traditional view:
         x_pxls = width_pxls
         y_pxls = int(round(
@@ -761,7 +754,6 @@ class Preprocessor:
         # TODO: consider allowing -ve scan for bi-directional scanning
         # Light-sheet scan, propagation and width axes:
         scan_steps, prop_pxls, width_pxls = volume.shape
-
         # Calculate max pixel shift for shearing on the prop. and scan axes:
         scan_step_size_um = calculate_scan_step_size_um(scan_step_size_px)
         prop_pxls_per_scan_step = scan_step_size_um / (
@@ -771,7 +763,6 @@ class Preprocessor:
         scan_steps_per_prop_px = 1 / prop_pxls_per_scan_step
         scan_px_shift_max = int(np.rint(
             scan_steps_per_prop_px * (prop_pxls - 1)))
-
         # Make projections:
         O1_proj = np.zeros((prop_pxls + prop_px_shift_max, width_pxls),
                            'uint16')
@@ -784,7 +775,6 @@ class Preprocessor:
             np.maximum(target, volume[i, :, :], out=target) # O1 
             np.maximum(scan_proj, volume[i, :, :], out=scan_proj) # scan 
             np.amax(volume[i, :, :], axis=1, out=width_proj[i, :]) # width
-
         # Unshear the width projection:
         unsheared_width_proj = np.zeros(
             (scan_steps + scan_px_shift_max, prop_pxls), 'uint16')
@@ -792,7 +782,6 @@ class Preprocessor:
             scan_px_shift = int(np.rint(i * scan_steps_per_prop_px))
             unsheared_width_proj[
                 scan_px_shift:scan_steps + scan_px_shift, i] = width_proj[:, i]
-
         # Scale images according to pixel size (divide by X_px_um):
         X_px_um = sample_px_um # width axis
         Y_px_um = sample_px_um * np.cos(tilt) # prop. axis to scan axis
@@ -802,12 +791,10 @@ class Preprocessor:
         scan_scale = O1_img.shape[0] / unsheared_width_proj.shape[0]
         # = scan_step_size_um / X_px_um rounded to match O1_img.shape[0]
         width_img = zoom(unsheared_width_proj,(scan_scale, Z_px_um / X_px_um))
-
         # Make image with all projections and flip for traditional view:
         y_pxls, x_pxls = O1_img.shape
         ln_px = preview_line_px_width # to keep lines of code short!
         ln_min, ln_max = O1_img.min(), O1_img.max()
-
         if out is None:
             out = np.zeros((y_pxls + scan_img.shape[0]  + 2*ln_px,
                             x_pxls + width_img.shape[1] + 2*ln_px), 'uint16')
@@ -821,24 +808,22 @@ class Preprocessor:
         out[ln_px:y_pxls + ln_px, x_pxls + 2*ln_px:] = np.fliplr(width_img)
         out[y_pxls + 2*ln_px:, x_pxls + 2*ln_px:] = np.full(
             (scan_img.shape[0], width_img.shape[1]), 0)
-
         # Add line separations between projections:
         out[:ln_px,    :] = ln_max
         out[:ln_px, ::10] = ln_min
         out[y_pxls + ln_px:y_pxls + 2*ln_px,    :] = ln_max
         out[y_pxls + ln_px:y_pxls + 2*ln_px, ::10] = ln_min
-
         out[:,    :ln_px] = ln_max
         out[::10, :ln_px] = ln_min
         out[:,    x_pxls + ln_px:x_pxls + 2*ln_px] = ln_max
         out[::10, x_pxls + ln_px:x_pxls + 2*ln_px] = ln_min
-
         out[:] = np.flipud(out)
         return return_value
 
 class Postprocessor:
-    # This method can be used for software autofocus. It uses an earlier
-    # 'preview' image to estimate the z location of the sample. Choose:
+    # 'estimate_sample_z_axis_px' can be used for software autofocus. It uses
+    # an earlier 'preview' image to estimate the z location of the sample in
+    # pixels. Multiply by 'sample_px_um' for an absolute value in z. Choose:
     # - 'max_intensity' to track the brightest z pixel
     # - 'max_gradient' as a proxy for the coverslip boundary z pixel
     def estimate_sample_z_axis_px(
@@ -870,7 +855,7 @@ class Postprocessor:
                 break
         return np.argmax(intensity_gradient)
 
-    # This method can be used for cropping empty pixels from raw data.
+    # 'estimate_roi' can be used for cropping empty pixels from raw data.
     # The snoutscope produces vast amounts of data very quickly, often with
     # many empty pixels - discarding them can help manage the deluge.
     def estimate_roi(
@@ -925,7 +910,7 @@ class Postprocessor:
                 break
         return i_min, i_max
 
-    # The native view is the most 'principled' view of the data for analysis
+    # The 'native view' is the most principled view of the data for analysis.
     # If scan_step_size_px == type(int) then no interpolation is needed to view
     # the volume. The native view looks at the sample with the 'tilt' of Snouty.
     def native_view(
@@ -943,7 +928,7 @@ class Postprocessor:
                 i, prop_px_shift:prop_pxls + prop_px_shift, :] = volume[i,:,:]
         return native_volume
 
-    # Very slow but pleasing - returns the traditional volume!
+    # Very slow but pleasing - rotates the native view to the traditional view!
     def traditional_view(
         self,
         native_volume, # native volume 3D: single volume, single channel
@@ -977,7 +962,7 @@ if __name__ == '__main__':
                            camera_type='edge 4.2', verbose=False)    
 
     # Create scope object:
-    scope = Snoutscope(100e9) # Max memory bytes for PC
+    scope = Snoutscope(100*1e9) # Max memory bytes for PC
     scope.apply_settings( # Mandatory call
         channels_per_slice=("LED", "488"), # ('LED','405','488','561','640')
         power_per_channel=(50, 10), # (5,0,20,30,100) # 0-100% match to channels
