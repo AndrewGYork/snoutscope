@@ -199,8 +199,12 @@ class Snoutscope:
                 data_directory = cwd + '\\' + folder + '\data'
                 if not os.path.exists(data_directory):
                     os.makedirs(data_directory)
+                metadata_directory = cwd + '\\' + folder + '\metadata'
+                if not os.path.exists(metadata_directory):
+                    os.makedirs(metadata_directory)
                 data_path = data_directory + '\\' + name
-                self._save_metadata(filename, delay_seconds, data_path)
+                metadata_path = metadata_directory + '\\' + name
+                self._save_metadata(filename, delay_seconds, metadata_path)
                 if display:
                     preview_directory = (cwd + '\\' + folder + '\preview')
                     if not os.path.exists(preview_directory):
@@ -333,7 +337,7 @@ class Snoutscope:
             'voxel_aspect_ratio':calculate_voxel_aspect_ratio(
                 self.scan_step_size_px),
             }
-        with open(os.path.splitext(path)[0] + '_metadata.txt', 'w') as file:
+        with open(os.path.splitext(path)[0] + '.txt', 'w') as file:
             for k, v in to_save.items():
                 file.write(k + ': ' + str(v) + '\n')
 
@@ -978,11 +982,11 @@ if __name__ == '__main__':
         ).join()
 
     # Run snoufocus and acquire:
-    scope.snoutfocus()
+    scope.snoutfocus(filename='test_data\init.tif')
     for i in range(2):
         scope.acquire(
             display=True,
-            filename='test_images\%06i.tif'%i, # comment out to avoid
+            filename='test_data\%06i.tif'%i, # comment out to avoid
             delay_seconds=0
             )
 ##    scope.spiral_tiling_preview(num_spirals=1, dx_mm=0.01, dy_mm=0.01)
