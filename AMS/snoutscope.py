@@ -948,7 +948,7 @@ if __name__ == '__main__':
     ### Set variables: tzcyx acquisition ###
     ## filter wheel options:        0:blocked,      1:open
     # 2:ET450/50M,  3:ET525/50M,    4:ET600/50M,    5:ET690/50M
-    # 6:ZETquadM,   7:empty         8:empty         9:empty
+    # 6:ZETquadM,   7:LP02-488RU    8:empty         9:empty
 
     # Scan: input user friendly options -> return values for .apply_settings()
     aspect_ratio = 2
