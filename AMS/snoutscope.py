@@ -376,15 +376,19 @@ class Snoutscope:
             piezo_voltage_limit = 150 # 15 um for current piezo
             piezo_voltage_step = 2 # 200 nm steps
             n2c = self.names_to_voltage_channels # A temporary nickname
-            voltages = []
+            v_open_shutter = np.zeros((self.ao.s2p(5*1e-3), # Shutter open time
+                                       self.ao.num_channels), 'float64')
+            v_open_shutter[:, n2c['snoutfocus_shutter']] = 5
+            voltages = [v_open_shutter]
             for piezo_voltage in np.arange(
                 0, piezo_voltage_limit+piezo_voltage_step, piezo_voltage_step):
                 v = np.zeros((period_pix, self.ao.num_channels), 'float64')
+                v[:, n2c['snoutfocus_shutter']] = 5
                 v[:roll_pix, n2c['camera']] = 5
                 v[:, n2c['snoutfocus_piezo']] = 10*(piezo_voltage /
                                                     piezo_voltage_limit) # 10 V
                 voltages.append(v)
-            exposures_per_buffer = len(voltages)
+            exposures_per_buffer = len(voltages[1:]) # remove shutter open array
             voltages = np.concatenate(voltages, axis=0)
             # Allocate memory and finalize microscope settings:
             data_buffer = self._get_data_buffer(
@@ -547,7 +551,8 @@ class Snoutscope:
             'camera': 0,
             'galvo': 4,
             'snoutfocus_piezo': 6,
-            'LED_power': 12, 
+            'snoutfocus_shutter': 7,
+            'LED_power': 12,
             '405_TTL': 16,
             '405_power': 17,
             '488_TTL': 20,
